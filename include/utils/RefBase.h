@@ -53,15 +53,6 @@ inline bool operator _op_ (const U* o) const {                  \
 
 // ---------------------------------------------------------------------------
 
-/* START JB MR1 COMPAT */
-class ReferenceConverterBase {
-public:
-    virtual size_t getReferenceTypeSize() const = 0;
-    virtual void* getReferenceBase(void const*) const = 0;
-    inline virtual ~ReferenceConverterBase() { }
-};
-/* END JB MR1 COMPAT */
-
 class ReferenceRenamer {
 protected:
     // destructor is purposedly not virtual so we avoid code overhead from
@@ -210,6 +201,13 @@ private:
 
 private:
     mutable volatile int32_t mCount;
+};
+
+// This is a wrapper around LightRefBase that simply enforces a virtual
+// destructor to eliminate the template requirement of LightRefBase
+class VirtualLightRefBase : public LightRefBase<VirtualLightRefBase> {
+public:
+    virtual ~VirtualLightRefBase() {}
 };
 
 // ---------------------------------------------------------------------------

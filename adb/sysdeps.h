@@ -26,8 +26,8 @@
 
 #ifdef _WIN32
 
-#include <windows.h>
 #include <winsock2.h>
+#include <windows.h>
 #include <ws2tcpip.h>
 #include <process.h>
 #include <fcntl.h>
@@ -35,6 +35,7 @@
 #include <sys/stat.h>
 #include <errno.h>
 #include <ctype.h>
+#include <direct.h>
 
 #define OS_PATH_SEPARATOR '\\'
 #define OS_PATH_SEPARATOR_STR "\\"
@@ -169,6 +170,8 @@ extern void*  load_file(const char*  pathname, unsigned*  psize);
 /* normally provided by <cutils/sockets.h> */
 extern int socket_loopback_client(int port, int type);
 extern int socket_network_client(const char *host, int port, int type);
+extern int socket_network_client_timeout(const char *host, int port, int type,
+                                         int timeout);
 extern int socket_loopback_server(int port, int type);
 extern int socket_inaddr_any_server(int port, int type);
 
@@ -515,6 +518,26 @@ static __inline__ char*  adb_strtok_r(char *str, const char *delim, char **savep
 }
 #undef   strtok_r
 #define  strtok_r  ___xxx_strtok_r
+
+#ifndef __FD_SET
+#define __FD_SET(fd, fdsetp) \
+	(((fd_set *)(fdsetp))->fds_bits[(fd) >> 5] |= (1<<((fd) & 31)))
+#endif
+
+#ifndef __FD_CLR
+#define __FD_CLR(fd, fdsetp) \
+	(((fd_set *)(fdsetp))->fds_bits[(fd) >> 5] &= ~(1<<((fd) & 31)))
+#endif
+
+#ifndef __FD_ISSET
+#define __FD_ISSET(fd, fdsetp) \
+	((((fd_set *)(fdsetp))->fds_bits[(fd) >> 5] & (1<<((fd) & 31))) != 0)
+#endif
+
+#ifndef __FD_ZERO
+#define __FD_ZERO(fdsetp) \
+	(memset (fdsetp, 0, sizeof (*(fd_set *)(fdsetp))))
+#endif
 
 #endif /* !_WIN32 */
 

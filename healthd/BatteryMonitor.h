@@ -1,6 +1,5 @@
 /*
  * Copyright (C) 2013 The Android Open Source Project
- * Copyright (C) 2013 The CyanogenMod Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,16 +17,14 @@
 #ifndef HEALTHD_BATTERYMONITOR_H
 #define HEALTHD_BATTERYMONITOR_H
 
+#include <batteryservice/BatteryService.h>
 #include <binder/IInterface.h>
 #include <utils/String8.h>
 #include <utils/Vector.h>
 
 #include "healthd.h"
-#include "BatteryPropertiesRegistrar.h"
 
 namespace android {
-
-class BatteryPropertiesRegistrar;
 
 class BatteryMonitor {
   public:
@@ -37,19 +34,21 @@ class BatteryMonitor {
         ANDROID_POWER_SUPPLY_TYPE_AC,
         ANDROID_POWER_SUPPLY_TYPE_USB,
         ANDROID_POWER_SUPPLY_TYPE_WIRELESS,
-        ANDROID_POWER_SUPPLY_TYPE_BATTERY,
-        ANDROID_POWER_SUPPLY_TYPE_DOCK_AC,
-        ANDROID_POWER_SUPPLY_TYPE_DOCK_BATTERY
+        ANDROID_POWER_SUPPLY_TYPE_BATTERY
     };
 
-    void init(struct healthd_config *hc, bool nosvcmgr);
+    void init(struct healthd_config *hc);
     bool update(void);
+    status_t getProperty(int id, struct BatteryProperty *val);
+    void dumpState(int fd);
 
   private:
     struct healthd_config *mHealthdConfig;
     Vector<String8> mChargerNames;
-
-    sp<BatteryPropertiesRegistrar> mBatteryPropertiesRegistrar;
+    bool mBatteryDevicePresent;
+    int mBatteryFixedCapacity;
+    int mBatteryFixedTemperature;
+    struct BatteryProperties props;
 
     int getBatteryStatus(const char* status);
     int getBatteryHealth(const char* status);

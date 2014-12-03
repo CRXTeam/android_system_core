@@ -1,6 +1,5 @@
 /*
  * Copyright (C) 2013 The Android Open Source Project
- * Copyright (C) 2013 The CyanogenMod Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,6 +18,8 @@
 #define _HEALTHD_H_
 
 #include <batteryservice/BatteryService.h>
+#include <sys/types.h>
+#include <utils/Errors.h>
 #include <utils/String8.h>
 
 // periodic_chores_interval_fast, periodic_chores_interval_slow: intervals at
@@ -49,22 +50,6 @@
 //    batteryCurrentNowPath: battery current (POWER_SUPPLY_PROP_CURRENT_NOW)
 //    batteryChargeCounterPath: battery accumulated charge
 //                                         (POWER_SUPPLY_PROP_CHARGE_COUNTER)
-//
-//    dockBatteryStatusPath: dock charging status (POWER_SUPPLY_PROP_STATUS)
-//    dockBatteryHealthPath: dock battery health (POWER_SUPPLY_PROP_HEALTH)
-//    dockBatteryPresentPath: dock battery present (POWER_SUPPLY_PROP_PRESENT)
-//    dockBatteryCapacityPath: dock remaining capacity (POWER_SUPPLY_PROP_CAPACITY)
-//    dockBatteryVoltagePath: dock battery voltage (POWER_SUPPLY_PROP_VOLTAGE_NOW)
-//    dockBatteryTemperaturePath: dock battery temperature (POWER_SUPPLY_PROP_TEMP)
-//    dockBatteryTechnologyPath: dock battery technology (POWER_SUPPLY_PROP_TECHNOLOGY)
-//    dockBatteryCurrentNowPath: dock battery current (POWER_SUPPLY_PROP_CURRENT_NOW)
-//    dockBatteryChargeCounterPath: dock battery accumulated charge
-//                                         (POWER_SUPPLY_PROP_CHARGE_COUNTER)
-//
-// The property dockBatterySupported determines if the healthd subsystem will search
-// and refresh all the power_supply sysfs attribute file paths for dock battery.
-// Its value is false by default.
-//
 
 struct healthd_config {
     int periodic_chores_interval_fast;
@@ -78,19 +63,41 @@ struct healthd_config {
     android::String8 batteryTemperaturePath;
     android::String8 batteryTechnologyPath;
     android::String8 batteryCurrentNowPath;
+    android::String8 batteryCurrentAvgPath;
     android::String8 batteryChargeCounterPath;
 
-    bool dockBatterySupported;
-    android::String8 dockBatteryStatusPath;
-    android::String8 dockBatteryHealthPath;
-    android::String8 dockBatteryPresentPath;
-    android::String8 dockBatteryCapacityPath;
-    android::String8 dockBatteryVoltagePath;
-    android::String8 dockBatteryTemperaturePath;
-    android::String8 dockBatteryTechnologyPath;
-    android::String8 dockBatteryCurrentNowPath;
-    android::String8 dockBatteryChargeCounterPath;
+    int (*energyCounter)(int64_t *);
 };
+
+// Global helper functions
+
+int healthd_register_event(int fd, void (*handler)(uint32_t));
+void healthd_battery_update();
+android::status_t healthd_get_property(int id,
+    struct android::BatteryProperty *val);
+void healthd_dump_battery_state(int fd);
+
+struct healthd_mode_ops {
+    void (*init)(struct healthd_config *config);
+    int (*preparetowait)(void);
+    void (*heartbeat)(void);
+    void (*battery_update)(struct android::BatteryProperties *props);
+};
+
+extern struct healthd_mode_ops *healthd_mode_ops;
+
+enum MODE {
+    NORMAL = 0,
+    QUICKBOOT,
+};
+
+// Charger mode
+
+void healthd_mode_charger_init(struct healthd_config *config);
+int healthd_mode_charger_preparetowait(void);
+void healthd_mode_charger_heartbeat(void);
+void healthd_mode_charger_battery_update(
+    struct android::BatteryProperties *props);
 
 // The following are implemented in libhealthd_board to handle board-specific
 // behavior.

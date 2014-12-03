@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2007 The Android Open Source Project
+ * Copyright (C) 2007-2014 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,6 +15,7 @@
  */
 
 #include <errno.h>
+#include <fnmatch.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -37,20 +38,23 @@
 
 #include <private/android_filesystem_config.h>
 #include <sys/time.h>
-#include <asm/page.h>
 #include <sys/wait.h>
 
 #include <cutils/list.h>
 #include <cutils/uevent.h>
 
 #include "devices.h"
+#include "ueventd_parser.h"
 #include "util.h"
 #include "log.h"
+
+#define UNUSED __attribute__((__unused__))
 
 #define SYSFS_PREFIX    "/sys"
 #define FIRMWARE_DIR1   "/etc/firmware"
 #define FIRMWARE_DIR2   "/vendor/firmware"
 #define FIRMWARE_DIR3   "/firmware/image"
+#define DEVICES_BASE    "/devices/soc.0"
 
 extern struct selabel_handle *sehandle;
 extern char bootdevice[32];
@@ -76,6 +80,7 @@ struct perms_ {
     unsigned int uid;
     unsigned int gid;
     unsigned short prefix;
+    unsigned short wildcard;
 };
 
 struct perm_node {
@@ -96,7 +101,8 @@ static list_declare(platform_names);
 
 int add_dev_perms(const char *name, const char *attr,
                   mode_t perm, unsigned int uid, unsigned int gid,
-                  unsigned short prefix) {
+                  unsigned short prefix,
+                  unsigned short wildcard) {
     struct perm_node *node = calloc(1, sizeof(*node));
     if (!node)
         return -ENOMEM;
@@ -115,6 +121,7 @@ int add_dev_perms(const char *name, const char *attr,
     node->dp.uid = uid;
     node->dp.gid = gid;
     node->dp.prefix = prefix;
+    node->dp.wildcard = wildcard;
 
     if (attr)
         list_add_tail(&sys_perms, &node->plist);
@@ -129,15 +136,17 @@ void fixup_sys_perms(const char *upath)
     char buf[512];
     struct listnode *node;
     struct perms_ *dp;
-    char *secontext;
 
-        /* upaths omit the "/sys" that paths in this list
-         * contain, so we add 4 when comparing...
-         */
+    /* upaths omit the "/sys" that paths in this list
+     * contain, so we add 4 when comparing...
+     */
     list_for_each(node, &sys_perms) {
         dp = &(node_to_item(node, struct perm_node, plist))->dp;
         if (dp->prefix) {
             if (strncmp(upath, dp->name + 4, strlen(dp->name + 4)))
+                continue;
+        } else if (dp->wildcard) {
+            if (fnmatch(dp->name + 4, upath, FNM_PATHNAME) != 0)
                 continue;
         } else {
             if (strcmp(upath, dp->name + 4))
@@ -145,24 +154,51 @@ void fixup_sys_perms(const char *upath)
         }
 
         if ((strlen(upath) + strlen(dp->attr) + 6) > sizeof(buf))
-            return;
+            break;
 
         sprintf(buf,"/sys%s/%s", upath, dp->attr);
         INFO("fixup %s %d %d 0%o\n", buf, dp->uid, dp->gid, dp->perm);
         chown(buf, dp->uid, dp->gid);
         chmod(buf, dp->perm);
-        if (sehandle) {
-            secontext = NULL;
-            selabel_lookup(sehandle, &secontext, buf, 0);
-            if (secontext) {
-                setfilecon(buf, secontext);
-                freecon(secontext);
-           }
-        }
+    }
+
+    // Now fixup SELinux file labels
+    int len = snprintf(buf, sizeof(buf), "/sys%s", upath);
+    if ((len < 0) || ((size_t) len >= sizeof(buf))) {
+        // Overflow
+        return;
+    }
+    if (access(buf, F_OK) == 0) {
+        INFO("restorecon_recursive: %s\n", buf);
+#ifdef _PLATFORM_BASE
+        if(!strcmp(upath, DEVICES_BASE))
+            restorecon(buf);
+        else
+            restorecon_recursive(buf);
+#else
+        restorecon_recursive(buf);
+#endif
     }
 }
 
-static mode_t get_device_perm(const char *path, unsigned *uid, unsigned *gid)
+static bool perm_path_matches(const char *path, struct perms_ *dp)
+{
+    if (dp->prefix) {
+        if (strncmp(path, dp->name, strlen(dp->name)) == 0)
+            return true;
+    } else if (dp->wildcard) {
+        if (fnmatch(dp->name, path, FNM_PATHNAME) == 0)
+            return true;
+    } else {
+        if (strcmp(path, dp->name) == 0)
+            return true;
+    }
+
+    return false;
+}
+
+static mode_t get_device_perm(const char *path, const char **links,
+                unsigned *uid, unsigned *gid)
 {
     mode_t perm;
     struct listnode *node;
@@ -173,19 +209,30 @@ static mode_t get_device_perm(const char *path, unsigned *uid, unsigned *gid)
      * override ueventd.rc
      */
     list_for_each_reverse(node, &dev_perms) {
+        bool match = false;
+
         perm_node = node_to_item(node, struct perm_node, plist);
         dp = &perm_node->dp;
 
-        if (dp->prefix) {
-            if (strncmp(path, dp->name, strlen(dp->name)))
-                continue;
+        if (perm_path_matches(path, dp)) {
+            match = true;
         } else {
-            if (strcmp(path, dp->name))
-                continue;
+            if (links) {
+                int i;
+                for (i = 0; links[i]; i++) {
+                    if (perm_path_matches(links[i], dp)) {
+                        match = true;
+                        break;
+                    }
+                }
+            }
         }
-        *uid = dp->uid;
-        *gid = dp->gid;
-        return dp->perm;
+
+        if (match) {
+            *uid = dp->uid;
+            *gid = dp->gid;
+            return dp->perm;
+        }
     }
     /* Default if nothing found. */
     *uid = 0;
@@ -194,8 +241,9 @@ static mode_t get_device_perm(const char *path, unsigned *uid, unsigned *gid)
 }
 
 static void make_device(const char *path,
-                        const char *upath,
-                        int block, int major, int minor)
+                        const char *upath UNUSED,
+                        int block, int major, int minor,
+                        const char **links)
 {
     unsigned uid;
     unsigned gid;
@@ -203,10 +251,10 @@ static void make_device(const char *path,
     dev_t dev;
     char *secontext = NULL;
 
-    mode = get_device_perm(path, &uid, &gid) | (block ? S_IFBLK : S_IFCHR);
+    mode = get_device_perm(path, links, &uid, &gid) | (block ? S_IFBLK : S_IFCHR);
 
     if (sehandle) {
-        selabel_lookup(sehandle, &secontext, path, mode);
+        selabel_lookup_best_match(sehandle, &secontext, path, links, mode);
         setfscreatecon(secontext);
     }
 
@@ -251,8 +299,7 @@ static void add_platform_device(const char *path)
         bus = node_to_item(node, struct platform_node, list);
         if ((bus->path_len < path_len) &&
                 (path[bus->path_len] == '/') &&
-                !strncmp(path, bus->path, bus->path_len) &&
-                (strcmp(bus->path, "/devices/soc.0") != 0))
+                !strncmp(path, bus->path, bus->path_len))
             /* subdevice of an existing platform, ignore it */
             return;
     }
@@ -303,6 +350,37 @@ static void remove_platform_device(const char *path)
             return;
         }
     }
+}
+
+/* Given a path that may start with a PCI device, populate the supplied buffer
+ * with the PCI domain/bus number and the peripheral ID and return 0.
+ * If it doesn't start with a PCI device, or there is some error, return -1 */
+static int find_pci_device_prefix(const char *path, char *buf, ssize_t buf_sz)
+{
+    const char *start, *end;
+
+    if (strncmp(path, "/devices/pci", 12))
+        return -1;
+
+    /* Beginning of the prefix is the initial "pci" after "/devices/" */
+    start = path + 9;
+
+    /* End of the prefix is two path '/' later, capturing the domain/bus number
+     * and the peripheral ID. Example: pci0000:00/0000:00:1f.2 */
+    end = strchr(start, '/');
+    if (!end)
+        return -1;
+    end = strchr(end + 1, '/');
+    if (!end)
+        return -1;
+
+    /* Make sure we have enough room for the string plus null terminator */
+    if (end - start + 1 > buf_sz)
+        return -1;
+
+    strncpy(buf, start, end - start);
+    buf[end - start] = '\0';
+    return 0;
 }
 
 #if LOG_UEVENTS
@@ -464,11 +542,12 @@ err:
     return NULL;
 }
 
-static char **parse_platform_block_device(struct uevent *uevent)
+static char **get_block_device_symlinks(struct uevent *uevent)
 {
     const char *device;
     struct platform_node *pdev;
     char *slash;
+    const char *type;
     int width;
     char buf[256];
     char link_path[256];
@@ -480,18 +559,24 @@ static char **parse_platform_block_device(struct uevent *uevent)
     struct stat info;
 
     pdev = find_platform_device(uevent->path);
-    if (!pdev)
+    if (pdev) {
+        device = pdev->name;
+        type = "platform";
+    } else if (!find_pci_device_prefix(uevent->path, buf, sizeof(buf))) {
+        device = buf;
+        type = "pci";
+    } else {
         return NULL;
-    device = pdev->name;
+    }
 
-    char **links = malloc(sizeof(char *) * 4);
+    char **links = malloc(sizeof(char *) * 6);
     if (!links)
         return NULL;
-    memset(links, 0, sizeof(char *) * 4);
+    memset(links, 0, sizeof(char *) * 6);
 
-    INFO("found platform device %s\n", device);
+    INFO("found %s device %s\n", type, device);
 
-    snprintf(link_path, sizeof(link_path), "/dev/block/platform/%s", device);
+    snprintf(link_path, sizeof(link_path), "/dev/block/%s/%s", type, device);
 
     if (uevent->partition_name) {
         p = strdup(uevent->partition_name);
@@ -502,11 +587,21 @@ static char **parse_platform_block_device(struct uevent *uevent)
             link_num++;
         else
             links[link_num] = NULL;
+        if (asprintf(&links[link_num], "/dev/block/bootdevice/by-name/%s", p) > 0)
+            link_num++;
+        else
+            links[link_num] = NULL;
+
         free(p);
     }
 
     if (uevent->partition_num >= 0) {
         if (asprintf(&links[link_num], "%s/by-num/p%d", link_path, uevent->partition_num) > 0)
+            link_num++;
+        else
+            links[link_num] = NULL;
+
+        if (asprintf(&links[link_num], "/dev/block/bootdevice/by-num/p%d", uevent->partition_num) > 0)
             link_num++;
         else
             links[link_num] = NULL;
@@ -531,7 +626,7 @@ static void handle_device(const char *action, const char *devpath,
     int i;
 
     if(!strcmp(action, "add")) {
-        make_device(devpath, path, block, major, minor);
+        make_device(devpath, path, block, major, minor, (const char **)links);
         if (links) {
             for (i = 0; links[i]; i++)
                 make_link(devpath, links[i]);
@@ -578,8 +673,11 @@ static const char *parse_device_name(struct uevent *uevent, unsigned int len)
     name++;
 
     /* too-long names would overrun our buffer */
-    if(strlen(name) > len)
+    if(strlen(name) > len) {
+        ERROR("DEVPATH=%s exceeds %u-character limit on filename; ignoring event\n",
+                name, len);
         return NULL;
+    }
 
     return name;
 }
@@ -599,43 +697,87 @@ static void handle_block_device_event(struct uevent *uevent)
     make_dir(base, 0755);
 
     if (!strncmp(uevent->path, "/devices/", 9))
-        links = parse_platform_block_device(uevent);
+        links = get_block_device_symlinks(uevent);
 
     handle_device(uevent->action, devpath, uevent->path, 1,
             uevent->major, uevent->minor, links);
+}
+
+#define DEVPATH_LEN 96
+
+static bool assemble_devpath(char *devpath, const char *dirname,
+        const char *devname)
+{
+    int s = snprintf(devpath, DEVPATH_LEN, "%s/%s", dirname, devname);
+    if (s < 0) {
+        ERROR("failed to assemble device path (%s); ignoring event\n",
+                strerror(errno));
+        return false;
+    } else if (s >= DEVPATH_LEN) {
+        ERROR("%s/%s exceeds %u-character limit on path; ignoring event\n",
+                dirname, devname, DEVPATH_LEN);
+        return false;
+    }
+    return true;
+}
+
+static void mkdir_recursive_for_devpath(const char *devpath)
+{
+    char dir[DEVPATH_LEN];
+    char *slash;
+
+    strcpy(dir, devpath);
+    slash = strrchr(dir, '/');
+    *slash = '\0';
+    mkdir_recursive(dir, 0755);
+}
+
+static inline void __attribute__((__deprecated__)) kernel_logger()
+{
+    INFO("kernel logger is deprecated\n");
 }
 
 static void handle_generic_device_event(struct uevent *uevent)
 {
     char *base;
     const char *name;
-    char devpath[96] = {0};
+    char devpath[DEVPATH_LEN] = {0};
     char **links = NULL;
 
     name = parse_device_name(uevent, 64);
     if (!name)
         return;
 
-    if (!strncmp(uevent->subsystem, "usb", 3)) {
+    struct ueventd_subsystem *subsystem =
+            ueventd_subsystem_find_by_name(uevent->subsystem);
+
+    if (subsystem) {
+        const char *devname;
+
+        switch (subsystem->devname_src) {
+        case DEVNAME_UEVENT_DEVNAME:
+            devname = uevent->device_name;
+            break;
+
+        case DEVNAME_UEVENT_DEVPATH:
+            devname = name;
+            break;
+
+        default:
+            ERROR("%s subsystem's devpath option is not set; ignoring event\n",
+                    uevent->subsystem);
+            return;
+        }
+
+        if (!assemble_devpath(devpath, subsystem->dirname, devname))
+            return;
+        mkdir_recursive_for_devpath(devpath);
+    } else if (!strncmp(uevent->subsystem, "usb", 3)) {
          if (!strcmp(uevent->subsystem, "usb")) {
             if (uevent->device_name) {
-                /*
-                 * create device node provided by kernel if present
-                 * see drivers/base/core.c
-                 */
-                char *p = devpath;
-                snprintf(devpath, sizeof(devpath), "/dev/%s", uevent->device_name);
-                /* skip leading /dev/ */
-                p += 5;
-                /* build directories */
-                while (*p) {
-                    if (*p == '/') {
-                        *p = 0;
-                        make_dir(devpath, 0755);
-                        *p = '/';
-                    }
-                    p++;
-                }
+                if (!assemble_devpath(devpath, "/dev", uevent->device_name))
+                    return;
+                mkdir_recursive_for_devpath(devpath);
              }
              else {
                  /* This imitates the file system that would be created
@@ -681,9 +823,31 @@ static void handle_generic_device_event(struct uevent *uevent)
          make_dir(base, 0755);
      } else if(!strncmp(uevent->subsystem, "misc", 4) &&
                  !strncmp(name, "log_", 4)) {
+         kernel_logger();
          base = "/dev/log/";
          make_dir(base, 0755);
          name += 4;
+     } else if (!strncmp(uevent->subsystem, "dvb", 3)) {
+         /* This imitates the file system that would be created
+          * if we were using devfs instead to preserve backward compatibility
+          * for users of dvb devices
+          */
+         int adapter_id;
+         char dev_name[20] = {0};
+
+         sscanf(name, "dvb%d.%s", &adapter_id, dev_name);
+
+         /* build dvb directory */
+         base = "/dev/dvb";
+         mkdir(base, 0755);
+
+         /* build adapter directory */
+         snprintf(devpath, sizeof(devpath), "/dev/dvb/adapter%d", adapter_id);
+         mkdir(devpath, 0755);
+
+         /* build actual device directory */
+         snprintf(devpath, sizeof(devpath), "/dev/dvb/adapter%d/%s",
+                  adapter_id, dev_name);
      } else
          base = "/dev/";
      links = get_character_device_symlinks(uevent);
@@ -699,7 +863,7 @@ static void handle_generic_device_event(struct uevent *uevent)
 
 static void handle_device_event(struct uevent *uevent)
 {
-    if (!strcmp(uevent->action,"add") || !strcmp(uevent->action, "change"))
+    if (!strcmp(uevent->action,"add") || !strcmp(uevent->action, "change") || !strcmp(uevent->action, "online"))
         fixup_sys_perms(uevent->path);
 
     if (!strncmp(uevent->subsystem, "block", 5)) {
@@ -866,7 +1030,7 @@ static void handle_firmware_event(struct uevent *uevent)
     }
 }
 
-#define UEVENT_MSG_LEN  1024
+#define UEVENT_MSG_LEN  2048
 void handle_device_fd()
 {
     char msg[UEVENT_MSG_LEN+2];

@@ -32,9 +32,9 @@
 #include <windows.h>
 #endif
 
+#if defined(HAVE_ANDROID_OS)
 nsecs_t systemTime(int clock)
 {
-#if defined(HAVE_POSIX_CLOCKS)
     static const clockid_t clocks[] = {
             CLOCK_REALTIME,
             CLOCK_MONOTONIC,
@@ -46,14 +46,19 @@ nsecs_t systemTime(int clock)
     t.tv_sec = t.tv_nsec = 0;
     clock_gettime(clocks[clock], &t);
     return nsecs_t(t.tv_sec)*1000000000LL + t.tv_nsec;
+}
 #else
-    // we don't support the clocks here.
+nsecs_t systemTime(int /*clock*/)
+{
+    // Clock support varies widely across hosts. Mac OS doesn't support
+    // posix clocks, older glibcs don't support CLOCK_BOOTTIME and Windows
+    // is windows.
     struct timeval t;
     t.tv_sec = t.tv_usec = 0;
     gettimeofday(&t, NULL);
     return nsecs_t(t.tv_sec)*1000000000LL + nsecs_t(t.tv_usec)*1000LL;
-#endif
 }
+#endif
 
 int toMillisecondTimeoutDelay(nsecs_t referenceTime, nsecs_t timeoutTime)
 {
@@ -70,65 +75,3 @@ int toMillisecondTimeoutDelay(nsecs_t referenceTime, nsecs_t timeoutTime)
     }
     return timeoutDelayMillis;
 }
-
-
-/*
- * ===========================================================================
- *      DurationTimer
- * ===========================================================================
- */
-
-using namespace android;
-
-// Start the timer.
-void DurationTimer::start(void)
-{
-    gettimeofday(&mStartWhen, NULL);
-}
-
-// Stop the timer.
-void DurationTimer::stop(void)
-{
-    gettimeofday(&mStopWhen, NULL);
-}
-
-// Get the duration in microseconds.
-long long DurationTimer::durationUsecs(void) const
-{
-    return (long) subtractTimevals(&mStopWhen, &mStartWhen);
-}
-
-// Subtract two timevals.  Returns the difference (ptv1-ptv2) in
-// microseconds.
-/*static*/ long long DurationTimer::subtractTimevals(const struct timeval* ptv1,
-    const struct timeval* ptv2)
-{
-    long long stop  = ((long long) ptv1->tv_sec) * 1000000LL +
-                      ((long long) ptv1->tv_usec);
-    long long start = ((long long) ptv2->tv_sec) * 1000000LL +
-                      ((long long) ptv2->tv_usec);
-    return stop - start;
-}
-
-// Add the specified amount of time to the timeval.
-/*static*/ void DurationTimer::addToTimeval(struct timeval* ptv, long usec)
-{
-    if (usec < 0) {
-        ALOG(LOG_WARN, "", "Negative values not supported in addToTimeval\n");
-        return;
-    }
-
-    // normalize tv_usec if necessary
-    if (ptv->tv_usec >= 1000000) {
-        ptv->tv_sec += ptv->tv_usec / 1000000;
-        ptv->tv_usec %= 1000000;
-    }
-
-    ptv->tv_usec += usec % 1000000;
-    if (ptv->tv_usec >= 1000000) {
-        ptv->tv_usec -= 1000000;
-        ptv->tv_sec++;
-    }
-    ptv->tv_sec += usec / 1000000;
-}
-

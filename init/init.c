@@ -46,12 +46,6 @@
 #include <private/android_filesystem_config.h>
 #include <termios.h>
 
-#include <sys/system_properties.h>
-
-#ifndef INITLOGO
-#include <linux/kd.h>
-#endif
-
 #include "devices.h"
 #include "init.h"
 #include "log.h"
@@ -63,7 +57,6 @@
 #include "util.h"
 #include "ueventd.h"
 #include "watchdogd.h"
-#include "vendor_init.h"
 
 struct selabel_handle *sehandle;
 struct selabel_handle *sehandle_prop;
@@ -106,110 +99,39 @@ static time_t process_needs_restart;
 
 static const char *ENV[32];
 
-static unsigned emmc_boot = 0;
-
 static unsigned charging_mode = 0;
-
-static const char *expand_environment(const char *val)
-{
-    int n;
-    const char *prev_pos = NULL, *copy_pos;
-    size_t len, prev_len = 0, copy_len;
-    char *expanded;
-
-    /* Basic expansion of environment variable; for now
-       we only assume 1 expansion at the start of val
-       and that it is marked as ${var} */
-    if (!val) {
-        return NULL;
-    }
-
-    if ((val[0] == '$') && (val[1] == '{')) {
-        for (n = 0; n < 31; n++) {
-            if (ENV[n]) {
-                len = strcspn(ENV[n], "=");
-                if (!strncmp(&val[2], ENV[n], len)
-                      && (val[2 + len] == '}')) {
-                    /* Matched existing env */
-                    prev_pos = &ENV[n][len + 1];
-                    prev_len = strlen(prev_pos);
-                    break;
-                }
-            }
-        }
-        copy_pos = index(val, '}');
-        if (copy_pos) {
-            copy_pos++;
-            copy_len = strlen(copy_pos);
-        } else {
-            copy_pos = val;
-            copy_len = strlen(val);
-        }
-    } else {
-        copy_pos = val;
-        copy_len = strlen(val);
-    }
-
-    len = prev_len + copy_len + 1;
-    expanded = malloc(len);
-    if (expanded) {
-        if (prev_pos) {
-            snprintf(expanded, len, "%s%s", prev_pos, copy_pos);
-        } else {
-            snprintf(expanded, len, "%s", copy_pos);
-        }
-    }
-
-    /* caller free */
-    return expanded;
-}
 
 /* add_environment - add "key=value" to the current environment */
 int add_environment(const char *key, const char *val)
 {
-    int n;
-    const char *expanded;
+    size_t n;
+    size_t key_len = strlen(key);
 
-    expanded = expand_environment(val);
-    if (!expanded) {
-        goto failed;
-    }
+    /* The last environment entry is reserved to terminate the list */
+    for (n = 0; n < (ARRAY_SIZE(ENV) - 1); n++) {
 
-    for (n = 0; n < 31; n++) {
-        if (!ENV[n]) {
-            size_t len = strlen(key) + strlen(expanded) + 2;
-            char *entry = malloc(len);
-            if (!entry) {
-                goto failed_cleanup;
+        /* Delete any existing entry for this key */
+        if (ENV[n] != NULL) {
+            size_t entry_key_len = strcspn(ENV[n], "=");
+            if ((entry_key_len == key_len) && (strncmp(ENV[n], key, entry_key_len) == 0)) {
+                free((char*)ENV[n]);
+                ENV[n] = NULL;
             }
-            snprintf(entry, len, "%s=%s", key, expanded);
-            free((char *)expanded);
+        }
+
+        /* Add entry if a free slot is available */
+        if (ENV[n] == NULL) {
+            size_t len = key_len + strlen(val) + 2;
+            char *entry = malloc(len);
+            snprintf(entry, len, "%s=%s", key, val);
             ENV[n] = entry;
             return 0;
-        } else {
-            char *entry;
-            size_t len = strlen(key);
-            if(!strncmp(ENV[n], key, len) && ENV[n][len] == '=') {
-                len = len + strlen(expanded) + 2;
-                entry = malloc(len);
-                if (!entry) {
-                    goto failed_cleanup;
-                }
-
-                free((char *)ENV[n]);
-                snprintf(entry, len, "%s=%s", key, expanded);
-                free((char *)expanded);
-                ENV[n] = entry;
-                return 0;
-            }
         }
     }
 
-failed_cleanup:
-    free((char *)expanded);
-failed:
-    ERROR("Fail to add env variable: %s. Not enough memory!", key);
-    return 1;
+    ERROR("No env. room to store: '%s':'%s'\n", key, val);
+
+    return -1;
 }
 
 static void zap_stdio(void)
@@ -263,7 +185,7 @@ void service_start(struct service *svc, const char *dynamic_args)
          * state and immediately takes it out of the restarting
          * state if it was in there
          */
-    svc->flags &= (~(SVC_DISABLED|SVC_RESTARTING|SVC_RESET|SVC_RESTART));
+    svc->flags &= (~(SVC_DISABLED|SVC_RESTARTING|SVC_RESET|SVC_RESTART|SVC_DISABLED_START));
     svc->time_started = 0;
 
         /* running processes require no additional work -- if
@@ -320,6 +242,9 @@ void service_start(struct service *svc, const char *dynamic_args)
             }
 
             rc = security_compute_create(mycon, fcon, string_to_security_class("process"), &scon);
+            if (rc == 0 && !strcmp(scon, mycon)) {
+                ERROR("Warning!  Service %s needs a SELinux domain defined; please fix!\n", svc->name);
+            }
             freecon(mycon);
             freecon(fcon);
             if (rc < 0) {
@@ -460,7 +385,7 @@ static void service_stop_or_reset(struct service *svc, int how)
 {
     /* The service is still SVC_RUNNING until its process exits, but if it has
      * already exited it shoudn't attempt a restart yet. */
-    svc->flags &= (~SVC_RESTARTING);
+    svc->flags &= ~(SVC_RESTARTING | SVC_DISABLED_START);
 
     if ((how != SVC_DISABLED) && (how != SVC_RESET) && (how != SVC_RESTART)) {
         /* Hrm, an illegal flag.  Default to SVC_DISABLED */
@@ -626,7 +551,8 @@ static int is_last_command(struct action *act, struct command *cmd)
 
 void execute_one_command(void)
 {
-    int ret;
+    int ret, i;
+    char cmd_str[256] = "";
 
     if (!cur_action || !cur_command || is_last_command(cur_action, cur_command)) {
         cur_action = action_remove_queue_head();
@@ -643,14 +569,24 @@ void execute_one_command(void)
         return;
 
     ret = cur_command->func(cur_command->nargs, cur_command->args);
-    INFO("command '%s' r=%d\n", cur_command->args[0], ret);
+    if (klog_get_level() >= KLOG_INFO_LEVEL) {
+        for (i = 0; i < cur_command->nargs; i++) {
+            strlcat(cmd_str, cur_command->args[i], sizeof(cmd_str));
+            if (i < cur_command->nargs - 1) {
+                strlcat(cmd_str, " ", sizeof(cmd_str));
+            }
+        }
+        INFO("command '%s' action=%s status=%d (%s:%d)\n",
+             cmd_str, cur_action ? cur_action->name : "", ret, cur_command->filename,
+             cur_command->line);
+    }
 }
 
 static int wait_for_coldboot_done_action(int nargs, char **args)
 {
     int ret;
     INFO("wait for %s\n", coldboot_done);
-    ret = wait_for_file(coldboot_done, COMMAND_RETRY_TIMEOUT);
+    ret = wait_for_file(coldboot_done, COLDBOOT_RETRY_TIMEOUT);
     if (ret)
         ERROR("Timed out waiting for %s\n", coldboot_done);
     return ret;
@@ -719,7 +655,7 @@ static int mix_hwrng_into_linux_rng_action(int nargs, char **args)
         total_bytes_written += chunk_size;
     }
 
-    INFO("Mixed %d bytes from /dev/hw_random into /dev/urandom",
+    INFO("Mixed %zu bytes from /dev/hw_random into /dev/urandom",
                 total_bytes_written);
     result = 0;
 
@@ -753,37 +689,28 @@ static int console_init_action(int nargs, char **args)
         have_console = 1;
     close(fd);
 
-#ifdef INITLOGO
-    if( load_565rle_image(INIT_IMAGE_FILE) ) {
-        fd = open("/dev/tty0", O_WRONLY);
-        if (fd >= 0) {
-            const char *msg;
-                msg = "\n"
-            "\n"
-            "\n"
-            "\n"
-            "\n"
-            "\n"
-            "\n"  // console is 40 cols x 30 lines
-            "\n"
-            "\n"
-            "\n"
-            "\n"
-            "\n"
-            "\n"
-            "\n"
-            "             A N D R O I D ";
-            write(fd, msg, strlen(msg));
-            close(fd);
-        }
-    }
-#else
-    fd = open("/dev/tty0", O_RDWR | O_SYNC);
+    fd = open("/dev/tty0", O_WRONLY);
     if (fd >= 0) {
-        ioctl(fd, KDSETMODE, KD_GRAPHICS);
+        const char *msg;
+            msg = "\n"
+        "\n"
+        "\n"
+        "\n"
+        "\n"
+        "\n"
+        "\n"  // console is 40 cols x 30 lines
+        "\n"
+        "\n"
+        "\n"
+        "\n"
+        "\n"
+        "\n"
+        "\n"
+        "             A N D R O I D ";
+        write(fd, msg, strlen(msg));
         close(fd);
     }
-#endif
+
     return 0;
 }
 
@@ -809,12 +736,6 @@ static void import_kernel_nv(char *name, int for_emulator)
 
     if (!strcmp(name,"qemu")) {
         strlcpy(qemu, value, sizeof(qemu));
-#ifdef WANTS_EMMC_BOOT
-    } else if (!strcmp(name,"androidboot.emmc")) {
-        if (!strcmp(value,"true")) {
-            emmc_boot = 1;
-        }
-#endif
     } else if (!strcmp(name,BOARD_CHARGING_CMDLINE_NAME)) {
         strlcpy(battchg_pause, value, sizeof(battchg_pause));
     } else if (!strncmp(name, "androidboot.", 12) && name_len > 12) {
@@ -869,8 +790,6 @@ static void export_kernel_boot_props(void)
 
     snprintf(tmp, PROP_VALUE_MAX, "%d", revision);
     property_set("ro.revision", tmp);
-    property_set("ro.emmc",emmc_boot ? "1" : "0");
-    property_set("ro.boot.emmc", emmc_boot ? "1" : "0");
 
     /* TODO: these are obsolete. We should delete them */
     if (!strcmp(bootmode,"factory"))
@@ -908,32 +827,21 @@ static int property_service_init_action(int nargs, char **args)
      * that /data/local.prop cannot interfere with them.
      */
     start_property_service();
+    if (get_property_set_fd() < 0) {
+        ERROR("start_property_service() failed\n");
+        exit(1);
+    }
 
-    /* update with vendor-specific property runtime
-     * overrides
-     */
-    vendor_load_properties();
     return 0;
 }
 
 static int signal_init_action(int nargs, char **args)
 {
     signal_init();
-    return 0;
-}
-
-static int check_startup_action(int nargs, char **args)
-{
-    /* make sure we actually have all the pieces we need */
-    if ((get_property_set_fd() < 0) ||
-        (get_signal_fd() < 0)) {
-        ERROR("init startup failure\n");
+    if (get_signal_fd() < 0) {
+        ERROR("signal_init() failed\n");
         exit(1);
     }
-
-        /* signal that we hit this point */
-    unlink("/dev/.booting");
-
     return 0;
 }
 
@@ -963,24 +871,21 @@ static int bootchart_init_action(int nargs, char **args)
 
 static const struct selinux_opt seopts_prop[] = {
         { SELABEL_OPT_PATH, "/property_contexts" },
+        { SELABEL_OPT_PATH, "/data/security/current/property_contexts" },
         { 0, NULL }
 };
 
 struct selabel_handle* selinux_android_prop_context_handle(void)
 {
-    int i = 0;
-    struct selabel_handle* sehandle = NULL;
-    while ((sehandle == NULL) && seopts_prop[i].value) {
-        sehandle = selabel_open(SELABEL_CTX_ANDROID_PROP, &seopts_prop[i], 1);
-        i++;
-    }
-
+    int policy_index = selinux_android_use_data_policy() ? 1 : 0;
+    struct selabel_handle* sehandle = selabel_open(SELABEL_CTX_ANDROID_PROP,
+                                                   &seopts_prop[policy_index], 1);
     if (!sehandle) {
         ERROR("SELinux:  Could not load property_contexts:  %s\n",
               strerror(errno));
         return NULL;
     }
-    INFO("SELinux: Loaded property contexts from %s\n", seopts_prop[i - 1].value);
+    INFO("SELinux: Loaded property contexts from %s\n", seopts_prop[policy_index].value);
     return sehandle;
 }
 
@@ -993,6 +898,7 @@ void selinux_init_all_handles(void)
 
 static bool selinux_is_disabled(void)
 {
+#ifdef ALLOW_DISABLE_SELINUX
     char tmp[PROP_VALUE_MAX];
 
     if (access("/sys/fs/selinux", F_OK) != 0) {
@@ -1006,12 +912,14 @@ static bool selinux_is_disabled(void)
         /* SELinux is compiled into the kernel, but we've been told to disable it. */
         return true;
     }
+#endif
 
     return false;
 }
 
 static bool selinux_is_enforcing(void)
 {
+#ifdef ALLOW_DISABLE_SELINUX
     char tmp[PROP_VALUE_MAX];
 
     if (property_get("ro.boot.selinux", tmp) == 0) {
@@ -1028,6 +936,7 @@ static bool selinux_is_enforcing(void)
         ERROR("SELinux: Unknown value of ro.boot.selinux. Got: \"%s\". Assuming enforcing.\n", tmp);
     }
 
+#endif
     return true;
 }
 
@@ -1053,29 +962,31 @@ int selinux_reload_policy(void)
     return 0;
 }
 
-int audit_callback(void *data, security_class_t cls, char *buf, size_t len)
+static int audit_callback(void *data, security_class_t cls __attribute__((unused)), char *buf, size_t len)
 {
     snprintf(buf, len, "property=%s", !data ? "NULL" : (char *)data);
     return 0;
 }
 
-static int charging_mode_booting(void)
+int log_callback(int type, const char *fmt, ...)
 {
-#ifndef BOARD_CHARGING_MODE_BOOTING_LPM
+    int level;
+    va_list ap;
+    switch (type) {
+    case SELINUX_WARNING:
+        level = KLOG_WARNING_LEVEL;
+        break;
+    case SELINUX_INFO:
+        level = KLOG_INFO_LEVEL;
+        break;
+    default:
+        level = KLOG_ERROR_LEVEL;
+        break;
+    }
+    va_start(ap, fmt);
+    klog_vwrite(level, fmt, ap);
+    va_end(ap);
     return 0;
-#else
-    int f;
-    char cmb;
-    f = open(BOARD_CHARGING_MODE_BOOTING_LPM, O_RDONLY);
-    if (f < 0)
-        return 0;
-
-    if (1 != read(f, (void *)&cmb,1))
-        return 0;
-
-    close(f);
-    return ('1' == cmb);
-#endif
 }
 
 static void selinux_initialize(void)
@@ -1097,6 +1008,25 @@ static void selinux_initialize(void)
     security_setenforce(is_enforcing);
 }
 
+static int charging_mode_booting(void)
+{
+#ifndef BOARD_CHARGING_MODE_BOOTING_LPM
+    return 0;
+#else
+    int f;
+    char cmb;
+    f = open(BOARD_CHARGING_MODE_BOOTING_LPM, O_RDONLY);
+    if (f < 0)
+        return 0;
+
+    if (1 != read(f, (void *)&cmb,1))
+        return 0;
+
+    close(f);
+    return ('1' == cmb);
+#endif
+}
+
 int main(int argc, char **argv)
 {
     int fd_count = 0;
@@ -1108,6 +1038,7 @@ int main(int argc, char **argv)
     int signal_fd_init = 0;
     int keychord_fd_init = 0;
     bool is_charger = false;
+    bool is_ffbm = false;
 
     if (!strcmp(basename(argv[0]), "ueventd"))
         return ueventd_main(argc, argv);
@@ -1122,11 +1053,6 @@ int main(int argc, char **argv)
          * together in the initramdisk on / and then we'll
          * let the rc file figure out the rest.
          */
-    /* Don't repeat the setup of these filesystems,
-     * it creates double mount points with an unknown effect
-     * on the system.  This init file is for 2nd-init anyway.
-     */
-#ifndef NO_DEVFS_SETUP
     mkdir("/dev", 0755);
     mkdir("/proc", 0755);
     mkdir("/sys", 0755);
@@ -1149,7 +1075,6 @@ int main(int argc, char **argv)
          */
     open_devnull_stdio();
     klog_init();
-#endif
     property_init();
 
     get_hardware_name(hardware, &revision);
@@ -1157,7 +1082,7 @@ int main(int argc, char **argv)
     process_kernel_cmdline();
 
     union selinux_callback cb;
-    cb.func_log = klog_write;
+    cb.func_log = log_callback;
     selinux_set_callback(SELINUX_CB_LOG, cb);
 
     cb.func_audit = audit_callback;
@@ -1173,30 +1098,15 @@ int main(int argc, char **argv)
     restorecon("/dev/__properties__");
     restorecon_recursive("/sys");
 
-    is_charger = !strcmp(bootmode, "charger");
+    is_ffbm = !strncmp(bootmode, "ffbm", 4);
+    if (!is_ffbm)
+        is_charger = !strcmp(bootmode, "charger") || charging_mode_booting();
 
     INFO("property init\n");
-    if (!is_charger)
-        property_load_boot_defaults();
+    property_load_boot_defaults();
 
     INFO("reading config file\n");
-
-    if (!charging_mode_booting())
-       init_parse_config_file("/init.rc");
-    else
-       init_parse_config_file("/lpm.rc");
-
-    /* Check for an emmc initialisation file and read if present */
-    if (emmc_boot && access("/init.emmc.rc", R_OK) == 0) {
-        INFO("Reading emmc config file");
-            init_parse_config_file("/init.emmc.rc");
-    }
-
-    /* Check for a target specific initialisation file and read if present */
-    if (access("/init.target.rc", R_OK) == 0) {
-        INFO("Reading target specific config file");
-            init_parse_config_file("/init.target.rc");
-    }
+    init_parse_config_file("/init.rc");
 
     action_for_each_trigger("early-init", action_add_queue_tail);
 
@@ -1208,41 +1118,29 @@ int main(int argc, char **argv)
     /* execute all the boot actions to get us started */
     action_for_each_trigger("init", action_add_queue_tail);
 
-    if (!is_charger) {
-        action_for_each_trigger("early-fs", action_add_queue_tail);
-        if(emmc_boot) {
-            action_for_each_trigger("emmc-fs", action_add_queue_tail);
-        } else {
-            action_for_each_trigger("fs", action_add_queue_tail);
-        }
-        action_for_each_trigger("post-fs", action_add_queue_tail);
-        action_for_each_trigger("post-fs-data", action_add_queue_tail);
-    } else {
-        action_for_each_trigger("charger-fs", action_add_queue_tail);
-    }
-
     /* Repeat mix_hwrng_into_linux_rng in case /dev/hw_random or /dev/random
      * wasn't ready immediately after wait_for_coldboot_done
      */
     queue_builtin_action(mix_hwrng_into_linux_rng_action, "mix_hwrng_into_linux_rng");
-
     queue_builtin_action(property_service_init_action, "property_service_init");
     queue_builtin_action(signal_init_action, "signal_init");
-    queue_builtin_action(check_startup_action, "check_startup");
 
     /* Older bootloaders use non-standard charging modes. Check for
      * those now, after mounting the filesystems */
     if (strcmp(battchg_pause, BOARD_CHARGING_CMDLINE_VALUE) == 0)
         is_charger = 1;
 
+    /* Don't mount filesystems or start core system services if in charger mode. */
     if (is_charger) {
         action_for_each_trigger("charger", action_add_queue_tail);
     } else {
-        action_for_each_trigger("early-boot", action_add_queue_tail);
-        action_for_each_trigger("boot", action_add_queue_tail);
+        if (is_ffbm) {
+            action_for_each_trigger("ffbm", action_add_queue_tail);
+        } else {
+            action_for_each_trigger("late-init", action_add_queue_tail);
+        }
     }
-
-        /* run all property triggers based on current state of the properties */
+    /* run all property triggers based on current state of the properties */
     queue_builtin_action(queue_property_triggers_action, "queue_property_triggers");
 
 
