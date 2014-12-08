@@ -1,27 +1,16 @@
-# Copyright 2006 The Android Open Source Project
+# Copyright 2006-2014 The Android Open Source Project
 
 LOCAL_PATH:= $(call my-dir)
 include $(CLEAR_VARS)
 
-LOCAL_SRC_FILES:= logcat.cpp
+LOCAL_SRC_FILES:= logcat.cpp event.logtags
 
 LOCAL_SHARED_LIBRARIES := liblog
 
-LOCAL_MODULE:= logcat
+LOCAL_MODULE := logcat
+
+LOCAL_CFLAGS := -Werror
 
 include $(BUILD_EXECUTABLE)
 
-########################
-include $(CLEAR_VARS)
-
-LOCAL_MODULE := event-log-tags
-
-#LOCAL_MODULE_TAGS := user development
-
-# This will install the file in /system/etc
-#
-LOCAL_MODULE_CLASS := ETC
-
-LOCAL_SRC_FILES := $(LOCAL_MODULE)
-
-include $(BUILD_PREBUILT)
+include $(call first-makefiles-under,$(LOCAL_PATH))

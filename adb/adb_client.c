@@ -16,10 +16,23 @@
 static transport_type __adb_transport = kTransportAny;
 static const char* __adb_serial = NULL;
 
+static int __adb_server_port = DEFAULT_ADB_PORT;
+static const char* __adb_server_name = NULL;
+
 void adb_set_transport(transport_type type, const char* serial)
 {
     __adb_transport = type;
     __adb_serial = serial;
+}
+
+void adb_set_tcp_specifics(int server_port)
+{
+    __adb_server_port = server_port;
+}
+
+void adb_set_tcp_name(const char* hostname)
+{
+    __adb_server_name = hostname;
 }
 
 int  adb_get_emulator_console_port(void)
@@ -174,7 +187,11 @@ int _adb_connect(const char *service)
     }
     snprintf(tmp, sizeof tmp, "%04x", len);
 
-    fd = socket_loopback_client(ADB_PORT, SOCK_STREAM);
+    if (__adb_server_name)
+        fd = socket_network_client(__adb_server_name, __adb_server_port, SOCK_STREAM);
+    else
+        fd = socket_loopback_client(__adb_server_port, SOCK_STREAM);
+
     if(fd < 0) {
         strcpy(__adb_error, "cannot connect to daemon");
         return -2;
@@ -195,6 +212,7 @@ int _adb_connect(const char *service)
         return -1;
     }
 
+    D("_adb_connect: return fd %d\n", fd);
     return fd;
 }
 
@@ -203,33 +221,38 @@ int adb_connect(const char *service)
     // first query the adb server's version
     int fd = _adb_connect("host:version");
 
-    if(fd == -2) {
-        fprintf(stdout,"* daemon not running. starting it now *\n");
+    D("adb_connect: service %s\n", service);
+    if(fd == -2 && __adb_server_name) {
+        fprintf(stderr,"** Cannot start server on remote host\n");
+        return fd;
+    } else if(fd == -2) {
+        fprintf(stdout,"* daemon not running. starting it now on port %d *\n",
+                __adb_server_port);
     start_server:
-        if(launch_server(0)) {
+        if(launch_server(__adb_server_port)) {
             fprintf(stderr,"* failed to start daemon *\n");
             return -1;
         } else {
             fprintf(stdout,"* daemon started successfully *\n");
-		}
+        }
         /* give the server some time to start properly and detect devices */
-        adb_sleep_ms(2000);
+        adb_sleep_ms(3000);
         // fall through to _adb_connect
     } else {
         // if server was running, check its version to make sure it is not out of date
         char buf[100];
-        int n;
+        size_t n;
         int version = ADB_SERVER_VERSION - 1;
 
         // if we have a file descriptor, then parse version result
         if(fd >= 0) {
-	        if(readx(fd, buf, 4)) goto error;
+            if(readx(fd, buf, 4)) goto error;
 
-		    buf[4] = 0;
-		    n = strtoul(buf, 0, 16);
-		    if(n > (int)sizeof(buf)) goto error;
-		    if(readx(fd, buf, n)) goto error;
-		    adb_close(fd);
+            buf[4] = 0;
+            n = strtoul(buf, 0, 16);
+            if(n > sizeof(buf)) goto error;
+            if(readx(fd, buf, n)) goto error;
+            adb_close(fd);
 
             if (sscanf(buf, "%04x", &version) != 1) goto error;
         } else {
@@ -240,14 +263,14 @@ int adb_connect(const char *service)
         }
 
         if(version != ADB_SERVER_VERSION) {
-	        printf("adb server is out of date.  killing...\n");
-	        fd = _adb_connect("host:kill");
-	        adb_close(fd);
+            printf("adb server is out of date.  killing...\n");
+            fd = _adb_connect("host:kill");
+            adb_close(fd);
 
-                /* XXX can we better detect its death? */
-	        adb_sleep_ms(2000);
+            /* XXX can we better detect its death? */
+            adb_sleep_ms(2000);
             goto start_server;
-	    }
+        }
     }
 
     // if the command is start-server, we are done.
@@ -255,9 +278,12 @@ int adb_connect(const char *service)
         return 0;
 
     fd = _adb_connect(service);
-    if(fd == -2) {
-        fprintf(stderr,"** daemon still not running");
+    if(fd == -1) {
+        D("_adb_connect error: %s\n", __adb_error);
+    } else if(fd == -2) {
+        fprintf(stderr,"** daemon still not running\n");
     }
+    D("adb_connect: return fd %d\n", fd);
 
     return fd;
 error:
@@ -270,6 +296,7 @@ int adb_command(const char *service)
 {
     int fd = adb_connect(service);
     if(fd < 0) {
+        fprintf(stderr, "error: %s\n", adb_error());
         return -1;
     }
 
@@ -298,7 +325,10 @@ char *adb_query(const char *service)
 
     buf[4] = 0;
     n = strtoul(buf, 0, 16);
-    if(n > 1024) goto oops;
+    if(n >= 0xffff) {
+        strcpy(__adb_error, "reply is too long (>= 64kB)");
+        goto oops;
+    }
 
     tmp = malloc(n + 1);
     if(tmp == 0) goto oops;
@@ -314,5 +344,3 @@ oops:
     adb_close(fd);
     return 0;
 }
-
-

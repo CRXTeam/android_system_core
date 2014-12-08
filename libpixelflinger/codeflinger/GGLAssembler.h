@@ -24,12 +24,18 @@
 
 #include <private/pixelflinger/ggl_context.h>
 
-#include "codeflinger/ARMAssemblerProxy.h"
+#include "ARMAssemblerProxy.h"
 
 
 namespace android {
 
 // ----------------------------------------------------------------------------
+
+#define CONTEXT_ADDR_LOAD(REG, FIELD) \
+    ADDR_LDR(AL, REG, mBuilderContext.Rctx, immed12_pre(GGL_OFFSETOF(FIELD)))
+
+#define CONTEXT_ADDR_STORE(REG, FIELD) \
+    ADDR_STR(AL, REG, mBuilderContext.Rctx, immed12_pre(GGL_OFFSETOF(FIELD)))
 
 #define CONTEXT_LOAD(REG, FIELD) \
     LDR(AL, REG, mBuilderContext.Rctx, immed12_pre(GGL_OFFSETOF(FIELD)))
@@ -43,6 +49,7 @@ class RegisterAllocator
 public:
     class RegisterFile;
     
+                    RegisterAllocator(int arch);
     RegisterFile&   registerFile();
     int             reserveReg(int reg);
     int             obtainReg();
@@ -52,8 +59,8 @@ public:
     class RegisterFile
     {
     public:
-                            RegisterFile();
-                            RegisterFile(const RegisterFile& rhs);
+                            RegisterFile(int arch);
+                            RegisterFile(const RegisterFile& rhs, int arch);
                             ~RegisterFile();
 
                 void        reset();
@@ -86,6 +93,9 @@ public:
         uint32_t    mRegs;
         uint32_t    mTouched;
         uint32_t    mStatus;
+        int         mArch;
+        uint32_t    mRegisterOffset;    // lets reg alloc use 2..17 for mips
+                                        // while arm uses 0..15
     };
  
     class Scratch
@@ -363,6 +373,10 @@ private:
                     const component_t& incoming,
                     const pixel_t& texel, int component, int tmu);
 
+    void    add(  component_t& dest,
+                    const component_t& incoming,
+                    const pixel_t& texel, int component);
+
     // load/store stuff
     void    store(const pointer_t& addr, const pixel_t& src, uint32_t flags=0);
     void    load(const pointer_t& addr, const pixel_t& dest, uint32_t flags=0);
@@ -517,6 +531,7 @@ private:
     component_info_t    mInfo[4];
     int                 mBlending;
     int                 mMasking;
+    int                 mAllMasked;
     int                 mLogicOp;
     int                 mAlphaTest;
     int                 mAA;

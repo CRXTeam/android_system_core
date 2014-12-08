@@ -23,11 +23,12 @@
 #include <pthread.h>
 #include <sys/types.h>
 
-#include <utils/KeyedVector.h>
-
+#include "tinyutils/KeyedVector.h"
 #include "tinyutils/smartpointer.h"
 
 namespace android {
+
+using namespace tinyutils;
 
 // ----------------------------------------------------------------------------
 
@@ -70,7 +71,7 @@ public:
 private:
     mutable int32_t     mCount;
             uint32_t*   mBase;
-            ssize_t     mSize;
+            size_t      mSize;
 };
 
 // ----------------------------------------------------------------------------

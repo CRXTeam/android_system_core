@@ -9,7 +9,7 @@
  *    notice, this list of conditions and the following disclaimer.
  *  * Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in
- *    the documentation and/or other materials provided with the 
+ *    the documentation and/or other materials provided with the
  *    distribution.
  *
  * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
@@ -19,7 +19,7 @@
  * COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
  * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
  * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
- * OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED 
+ * OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
  * AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
  * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
@@ -42,6 +42,7 @@
 #define DBG(x...)
 #endif
 
+#define MAX_USBFS_BULK_SIZE (1024 * 1024)
 
 /** Structure usb_handle describes our connection to the usb device via
   AdbWinApi.dll. This structure is returned from usb_open() routine and
@@ -50,13 +51,13 @@
 struct usb_handle {
     /// Handle to USB interface
     ADBAPIHANDLE  adb_interface;
-    
+
     /// Handle to USB read pipe (endpoint)
     ADBAPIHANDLE  adb_read_pipe;
-    
+
     /// Handle to USB write pipe (endpoint)
     ADBAPIHANDLE  adb_write_pipe;
-    
+
     /// Interface name
     char*         interface_name;
 };
@@ -151,7 +152,7 @@ usb_handle* do_usb_open(const wchar_t* interface_name) {
 }
 
 int usb_write(usb_handle* handle, const void* data, int len) {
-    unsigned long time_out = 500 + len * 8;
+    unsigned long time_out = 5000;
     unsigned long written = 0;
     unsigned count = 0;
     int ret;
@@ -160,7 +161,7 @@ int usb_write(usb_handle* handle, const void* data, int len) {
     if (NULL != handle) {
         // Perform write
         while(len > 0) {
-            int xfer = (len > 4096) ? 4096 : len;
+            int xfer = (len > MAX_USBFS_BULK_SIZE) ? MAX_USBFS_BULK_SIZE : len;
             ret = AdbWriteEndpointSync(handle->adb_write_pipe,
                                    (void*)data,
                                    (unsigned long)xfer,
@@ -177,7 +178,7 @@ int usb_write(usb_handle* handle, const void* data, int len) {
 
             count += written;
             len -= written;
-            data += written;
+            data = (const char *)data + written;
 
             if (len == 0)
                 return count;
@@ -193,14 +194,14 @@ int usb_write(usb_handle* handle, const void* data, int len) {
 }
 
 int usb_read(usb_handle *handle, void* data, int len) {
-    unsigned long time_out = 500 + len * 8;
+    unsigned long time_out = 0;
     unsigned long read = 0;
     int ret;
 
     DBG("usb_read %d\n", len);
     if (NULL != handle) {
         while (1) {
-            int xfer = (len > 4096) ? 4096 : len;
+            int xfer = (len > MAX_USBFS_BULK_SIZE) ? MAX_USBFS_BULK_SIZE : len;
 
 	        ret = AdbReadEndpointSync(handle->adb_read_pipe,
 	                              (void*)data,
@@ -211,7 +212,7 @@ int usb_read(usb_handle *handle, void* data, int len) {
             DBG("usb_read got: %ld, expected: %d, errno: %d\n", read, xfer, errno);
             if (ret) {
                 return read;
-            } else if (errno != ERROR_SEM_TIMEOUT) {
+            } else {
                 // assume ERROR_INVALID_HANDLE indicates we are disconnected
                 if (errno == ERROR_INVALID_HANDLE)
                     usb_kick(handle);
@@ -268,6 +269,11 @@ int usb_close(usb_handle* handle) {
     return 0;
 }
 
+int usb_wait_for_disconnect(usb_handle *usb) {
+    /* TODO: Punt for now */
+    return 0;
+}
+
 int recognized_device(usb_handle* handle, ifc_match_func callback) {
     struct usb_ifc_info info;
     USB_DEVICE_DESCRIPTOR device_desc;
@@ -301,13 +307,16 @@ int recognized_device(usb_handle* handle, ifc_match_func callback) {
     info.ifc_class = interf_desc.bInterfaceClass;
     info.ifc_subclass = interf_desc.bInterfaceSubClass;
     info.ifc_protocol = interf_desc.bInterfaceProtocol;
-    
+    info.writable = 1;
+
     // read serial number (if there is one)
     unsigned long serial_number_len = sizeof(info.serial_number);
     if (!AdbGetSerialNumber(handle->adb_interface, info.serial_number,
                     &serial_number_len, true)) {
         info.serial_number[0] = 0;
     }
+
+    info.device_path[0] = 0;
 
     if (callback(&info) == 0) {
         return 1;

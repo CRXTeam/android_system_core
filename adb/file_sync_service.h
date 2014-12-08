@@ -17,7 +17,7 @@
 #ifndef _FILE_SYNC_SERVICE_H_
 #define _FILE_SYNC_SERVICE_H_
 
-#ifdef __ppc__
+#ifdef HAVE_BIG_ENDIAN
 static inline unsigned __swap_uint32(unsigned x) 
 {
     return (((x) & 0xFF000000) >> 24)
@@ -72,15 +72,15 @@ typedef union {
     struct {
         unsigned id;
         unsigned msglen;
-    } status;    
+    } status;
 } syncmsg;
 
 
 void file_sync_service(int fd, void *cookie);
 int do_sync_ls(const char *path);
-int do_sync_push(const char *lpath, const char *rpath, int verifyApk);
-int do_sync_sync(const char *lpath, const char *rpath);
-int do_sync_pull(const char *rpath, const char *lpath);
+int do_sync_push(const char *lpath, const char *rpath, int show_progress);
+int do_sync_sync(const char *lpath, const char *rpath, int listonly);
+int do_sync_pull(const char *rpath, const char *lpath, int show_progress, int pullTime);
 
 #define SYNC_DATA_MAX (64*1024)
 

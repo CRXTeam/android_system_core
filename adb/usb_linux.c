@@ -21,6 +21,7 @@
 
 #include <sys/ioctl.h>
 #include <sys/types.h>
+#include <sys/time.h>
 #include <dirent.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -44,7 +45,7 @@
 /* usb scan debugging is waaaay too verbose */
 #define DBGX(x...)
 
-static adb_mutex_t usb_lock = ADB_MUTEX_INITIALIZER;
+ADB_MUTEX_DEFINE( usb_lock );
 
 struct usb_handle
 {
@@ -57,6 +58,7 @@ struct usb_handle
     unsigned char ep_out;
 
     unsigned zero_mask;
+    unsigned writeable;
 
     struct usbdevfs_urb urb_in;
     struct usbdevfs_urb urb_out;
@@ -114,8 +116,9 @@ static void kick_disconnected_devices()
 
 }
 
-static void register_device(const char *dev_name, unsigned char ep_in, unsigned char ep_out,
-                            int ifc, const char *serial, unsigned zero_mask);
+static void register_device(const char *dev_name, const char *devpath,
+                            unsigned char ep_in, unsigned char ep_out,
+                            int ifc, int serial_index, unsigned zero_mask);
 
 static inline int badname(const char *name)
 {
@@ -125,19 +128,18 @@ static inline int badname(const char *name)
     return 0;
 }
 
-static int find_usb_device(const char *base,
-                           void (*register_device_callback) (const char *, unsigned char, unsigned char, int, const char *, unsigned))
+static void find_usb_device(const char *base,
+        void (*register_device_callback)
+                (const char *, const char *, unsigned char, unsigned char, int, int, unsigned))
 {
     char busname[32], devname[32];
     unsigned char local_ep_in, local_ep_out;
     DIR *busdir , *devdir ;
     struct dirent *de;
     int fd ;
-    int found_device = 0;
-    char serial[256];
 
     busdir = opendir(base);
-    if(busdir == 0) return 0;
+    if(busdir == 0) return;
 
     while((de = readdir(busdir)) != 0) {
         if(badname(de->d_name)) continue;
@@ -148,15 +150,15 @@ static int find_usb_device(const char *base,
 
 //        DBGX("[ scanning %s ]\n", busname);
         while((de = readdir(devdir))) {
-            unsigned char devdesc[256];
+            unsigned char devdesc[4096];
             unsigned char* bufptr = devdesc;
+            unsigned char* bufend;
             struct usb_device_descriptor* device;
             struct usb_config_descriptor* config;
             struct usb_interface_descriptor* interface;
             struct usb_endpoint_descriptor *ep1, *ep2;
             unsigned zero_mask = 0;
             unsigned vid, pid;
-            int i, interfaces;
             size_t desclength;
 
             if(badname(de->d_name)) continue;
@@ -168,15 +170,16 @@ static int find_usb_device(const char *base,
             }
 
 //            DBGX("[ scanning %s ]\n", devname);
-            if((fd = unix_open(devname, O_RDWR)) < 0) {
+            if((fd = unix_open(devname, O_RDONLY | O_CLOEXEC)) < 0) {
                 continue;
             }
 
             desclength = adb_read(fd, devdesc, sizeof(devdesc));
+            bufend = bufptr + desclength;
 
                 // should have device and configuration descriptors, and atleast two endpoints
             if (desclength < USB_DT_DEVICE_SIZE + USB_DT_CONFIG_SIZE) {
-                D("desclength %d is too small\n", desclength);
+                D("desclength %zu is too small\n", desclength);
                 adb_close(fd);
                 continue;
             }
@@ -189,9 +192,8 @@ static int find_usb_device(const char *base,
                 continue;
             }
 
-            vid = __le16_to_cpu(device->idVendor);
-            pid = __le16_to_cpu(device->idProduct);
-            pid = devdesc[10] | (devdesc[11] << 8);
+            vid = device->idVendor;
+            pid = device->idProduct;
             DBGX("[ %s is V:%04x P:%04x ]\n", devname, vid, pid);
 
                 // should have config descriptor next
@@ -203,112 +205,118 @@ static int find_usb_device(const char *base,
                 continue;
             }
 
-                // loop through all the interfaces and look for the ADB interface
-            interfaces = config->bNumInterfaces;
-            for (i = 0; i < interfaces; i++) {
-                if (bufptr + USB_DT_ENDPOINT_SIZE > devdesc + desclength)
-                    break;
+                // loop through all the descriptors and look for the ADB interface
+            while (bufptr < bufend) {
+                unsigned char length = bufptr[0];
+                unsigned char type = bufptr[1];
 
-                interface = (struct usb_interface_descriptor *)bufptr;
-                bufptr += USB_DT_INTERFACE_SIZE;
-                if (interface->bLength != USB_DT_INTERFACE_SIZE ||
-                    interface->bDescriptorType != USB_DT_INTERFACE) {
-                    D("usb_interface_descriptor not found\n");
-                    break;
-                }
+                if (type == USB_DT_INTERFACE) {
+                    interface = (struct usb_interface_descriptor *)bufptr;
+                    bufptr += length;
 
-                DBGX("bInterfaceClass: %d,  bInterfaceSubClass: %d,"
-                     "bInterfaceProtocol: %d, bNumEndpoints: %d\n",
-                     interface->bInterfaceClass, interface->bInterfaceSubClass,
-                     interface->bInterfaceProtocol, interface->bNumEndpoints);
-
-                if (interface->bNumEndpoints == 2 &&
-                        is_adb_interface(vid, pid, interface->bInterfaceClass,
-                        interface->bInterfaceSubClass, interface->bInterfaceProtocol))  {
-
-                    DBGX("looking for bulk endpoints\n");
-                        // looks like ADB...
-                    ep1 = (struct usb_endpoint_descriptor *)bufptr;
-                    bufptr += USB_DT_ENDPOINT_SIZE;
-                    ep2 = (struct usb_endpoint_descriptor *)bufptr;
-                    bufptr += USB_DT_ENDPOINT_SIZE;
-
-                    if (bufptr > devdesc + desclength ||
-                        ep1->bLength != USB_DT_ENDPOINT_SIZE ||
-                        ep1->bDescriptorType != USB_DT_ENDPOINT ||
-                        ep2->bLength != USB_DT_ENDPOINT_SIZE ||
-                        ep2->bDescriptorType != USB_DT_ENDPOINT) {
-                        D("endpoints not found\n");
+                    if (length != USB_DT_INTERFACE_SIZE) {
+                        D("interface descriptor has wrong size\n");
                         break;
                     }
 
-                        // both endpoints should be bulk
-                    if (ep1->bmAttributes != USB_ENDPOINT_XFER_BULK ||
-                        ep2->bmAttributes != USB_ENDPOINT_XFER_BULK) {
-                        D("bulk endpoints not found\n");
-                        continue;
-                    }
+                    DBGX("bInterfaceClass: %d,  bInterfaceSubClass: %d,"
+                         "bInterfaceProtocol: %d, bNumEndpoints: %d\n",
+                         interface->bInterfaceClass, interface->bInterfaceSubClass,
+                         interface->bInterfaceProtocol, interface->bNumEndpoints);
 
-                        /* aproto 01 needs 0 termination */
-                    if(interface->bInterfaceProtocol == 0x01) {
-                        zero_mask = ep1->wMaxPacketSize - 1;
-                    }
+                    if (interface->bNumEndpoints == 2 &&
+                            is_adb_interface(vid, pid, interface->bInterfaceClass,
+                            interface->bInterfaceSubClass, interface->bInterfaceProtocol))  {
 
-                        // we have a match.  now we just need to figure out which is in and which is out.
-                    if (ep1->bEndpointAddress & USB_ENDPOINT_DIR_MASK) {
-                        local_ep_in = ep1->bEndpointAddress;
-                        local_ep_out = ep2->bEndpointAddress;
-                    } else {
-                        local_ep_in = ep2->bEndpointAddress;
-                        local_ep_out = ep1->bEndpointAddress;
-                    }
+                        struct stat st;
+                        char pathbuf[128];
+                        char link[256];
+                        char *devpath = NULL;
 
-                        // read the device's serial number
-                    serial[0] = 0;
-                    memset(serial, 0, sizeof(serial));
-                    if (device->iSerialNumber) {
-                        struct usbdevfs_ctrltransfer  ctrl;
-                        __u16 buffer[128];
-                        int result;
+                        DBGX("looking for bulk endpoints\n");
+                            // looks like ADB...
+                        ep1 = (struct usb_endpoint_descriptor *)bufptr;
+                        bufptr += USB_DT_ENDPOINT_SIZE;
 
-                        memset(buffer, 0, sizeof(buffer));
-                        memset(&ctrl, 0, sizeof(ctrl));
-
-                        ctrl.bRequestType = USB_DIR_IN|USB_TYPE_STANDARD|USB_RECIP_DEVICE;
-                        ctrl.bRequest = USB_REQ_GET_DESCRIPTOR;
-                        ctrl.wValue = (USB_DT_STRING << 8) | device->iSerialNumber;
-                        ctrl.wIndex = 0;
-                        ctrl.wLength = sizeof(buffer);
-                        ctrl.data = buffer;
-
-                        result = ioctl(fd, USBDEVFS_CONTROL, &ctrl);
-                        if (result > 0) {
-                            int i;
-                                // skip first word, and copy the rest to the serial string, changing shorts to bytes.
-                            result /= 2;
-                            for (i = 1; i < result; i++)
-                                serial[i - 1] = buffer[i];
-                            serial[i - 1] = 0;
+                        // USB3 devices are required to have superspeed
+                        // companion descriptors. They aren't needed to
+                        // locate the target so just skip them.
+                        //
+                        // When using the Android build environment, the old
+                        // ch9.h header from the prebuilts directory for the
+                        // host does not contain superspeed definitions.
+#ifndef USB_DT_SS_EP_COMP_SIZE
+#define USB_DT_SS_EP_COMP_SIZE      6
+#endif
+                        if (device->bcdUSB >= 0x0300) {
+                            bufptr += USB_DT_SS_EP_COMP_SIZE;
                         }
+
+                        ep2 = (struct usb_endpoint_descriptor *)bufptr;
+                        bufptr += USB_DT_ENDPOINT_SIZE;
+
+                        if (bufptr > devdesc + desclength ||
+                            ep1->bLength != USB_DT_ENDPOINT_SIZE ||
+                            ep1->bDescriptorType != USB_DT_ENDPOINT ||
+                            ep2->bLength != USB_DT_ENDPOINT_SIZE ||
+                            ep2->bDescriptorType != USB_DT_ENDPOINT) {
+                            D("endpoints not found\n");
+                            break;
+                        }
+
+                            // both endpoints should be bulk
+                        if (ep1->bmAttributes != USB_ENDPOINT_XFER_BULK ||
+                            ep2->bmAttributes != USB_ENDPOINT_XFER_BULK) {
+                            D("bulk endpoints not found\n");
+                            continue;
+                        }
+                            /* aproto 01 needs 0 termination */
+                        if(interface->bInterfaceProtocol == 0x01) {
+                            zero_mask = ep1->wMaxPacketSize - 1;
+                        }
+
+                            // we have a match.  now we just need to figure out which is in and which is out.
+                        if (ep1->bEndpointAddress & USB_ENDPOINT_DIR_MASK) {
+                            local_ep_in = ep1->bEndpointAddress;
+                            local_ep_out = ep2->bEndpointAddress;
+                        } else {
+                            local_ep_in = ep2->bEndpointAddress;
+                            local_ep_out = ep1->bEndpointAddress;
+                        }
+
+                            // Determine the device path
+                        if (!fstat(fd, &st) && S_ISCHR(st.st_mode)) {
+                            char *slash;
+                            ssize_t link_len;
+                            snprintf(pathbuf, sizeof(pathbuf), "/sys/dev/char/%d:%d",
+                                     major(st.st_rdev), minor(st.st_rdev));
+                            link_len = readlink(pathbuf, link, sizeof(link) - 1);
+                            if (link_len > 0) {
+                                link[link_len] = '\0';
+                                slash = strrchr(link, '/');
+                                if (slash) {
+                                    snprintf(pathbuf, sizeof(pathbuf),
+                                             "usb:%s", slash + 1);
+                                    devpath = pathbuf;
+                                }
+                            }
+                        }
+
+                        register_device_callback(devname, devpath,
+                                local_ep_in, local_ep_out,
+                                interface->bInterfaceNumber, device->iSerialNumber, zero_mask);
+                        break;
                     }
-
-                    register_device_callback(devname, local_ep_in, local_ep_out, i, serial, zero_mask);
-
-                    found_device = 1;
-                    break;
                 } else {
-                        // skip to next interface
-                    bufptr += (interface->bNumEndpoints * USB_DT_ENDPOINT_SIZE);
+                    bufptr += length;
                 }
-            } // end of for
+            } // end of while
 
             adb_close(fd);
         } // end of devdir while
         closedir(devdir);
     } //end of busdir while
     closedir(busdir);
-
-    return found_device;
 }
 
 void usb_cleanup()
@@ -319,6 +327,8 @@ static int usb_bulk_write(usb_handle *h, const void *data, int len)
 {
     struct usbdevfs_urb *urb = &h->urb_out;
     int res;
+    struct timeval tv;
+    struct timespec ts;
 
     memset(urb, 0, sizeof(*urb));
     urb->type = USBDEVFS_URB_TYPE_BULK;
@@ -345,8 +355,12 @@ static int usb_bulk_write(usb_handle *h, const void *data, int len)
     res = -1;
     h->urb_out_busy = 1;
     for(;;) {
-        adb_cond_wait(&h->notify, &h->lock);
-        if(h->dead) {
+        /* time out after five seconds */
+        gettimeofday(&tv, NULL);
+        ts.tv_sec = tv.tv_sec + 5;
+        ts.tv_nsec = tv.tv_usec * 1000L;
+        res = pthread_cond_timedwait(&h->notify, &h->lock, &ts);
+        if(res < 0 || h->dead) {
             break;
         }
         if(h->urb_out_busy == 0) {
@@ -395,6 +409,7 @@ static int usb_bulk_read(usb_handle *h, void *data, int len)
         h->reaper_thread = pthread_self();
         adb_mutex_unlock(&h->lock);
         res = ioctl(h->desc, USBDEVFS_REAPURB, &out);
+        int saved_errno = errno;
         adb_mutex_lock(&h->lock);
         h->reaper_thread = 0;
         if(h->dead) {
@@ -402,7 +417,7 @@ static int usb_bulk_read(usb_handle *h, void *data, int len)
             break;
         }
         if(res < 0) {
-            if(errno == EINTR) {
+            if(saved_errno == EINTR) {
                 continue;
             }
             D("[ reap urb - error ]\n");
@@ -512,26 +527,30 @@ void usb_kick(usb_handle *h)
     if(h->dead == 0) {
         h->dead = 1;
 
-        /* HACK ALERT!
-        ** Sometimes we get stuck in ioctl(USBDEVFS_REAPURB).
-        ** This is a workaround for that problem.
-        */
-        if (h->reaper_thread) {
-            pthread_kill(h->reaper_thread, SIGALRM);
-        }
+        if (h->writeable) {
+            /* HACK ALERT!
+            ** Sometimes we get stuck in ioctl(USBDEVFS_REAPURB).
+            ** This is a workaround for that problem.
+            */
+            if (h->reaper_thread) {
+                pthread_kill(h->reaper_thread, SIGALRM);
+            }
 
-        /* cancel any pending transactions
-        ** these will quietly fail if the txns are not active,
-        ** but this ensures that a reader blocked on REAPURB
-        ** will get unblocked
-        */
-        ioctl(h->desc, USBDEVFS_DISCARDURB, &h->urb_in);
-        ioctl(h->desc, USBDEVFS_DISCARDURB, &h->urb_out);
-        h->urb_in.status = -ENODEV;
-        h->urb_out.status = -ENODEV;
-        h->urb_in_busy = 0;
-        h->urb_out_busy = 0;
-        adb_cond_broadcast(&h->notify);
+            /* cancel any pending transactions
+            ** these will quietly fail if the txns are not active,
+            ** but this ensures that a reader blocked on REAPURB
+            ** will get unblocked
+            */
+            ioctl(h->desc, USBDEVFS_DISCARDURB, &h->urb_in);
+            ioctl(h->desc, USBDEVFS_DISCARDURB, &h->urb_out);
+            h->urb_in.status = -ENODEV;
+            h->urb_out.status = -ENODEV;
+            h->urb_in_busy = 0;
+            h->urb_out_busy = 0;
+            adb_cond_broadcast(&h->notify);
+        } else {
+            unregister_usb_transport(h);
+        }
     }
     adb_mutex_unlock(&h->lock);
 }
@@ -553,13 +572,13 @@ int usb_close(usb_handle *h)
     return 0;
 }
 
-static void register_device(const char *dev_name,
+static void register_device(const char *dev_name, const char *devpath,
                             unsigned char ep_in, unsigned char ep_out,
-                            int interface,
-                            const char *serial, unsigned zero_mask)
+                            int interface, int serial_index, unsigned zero_mask)
 {
     usb_handle* usb = 0;
     int n = 0;
+    char serial[256];
 
         /* Since Linux will not reassign the device ID (and dev_name)
         ** as long as the device is open, we can add to the list here
@@ -585,6 +604,7 @@ static void register_device(const char *dev_name,
     usb->ep_in = ep_in;
     usb->ep_out = ep_out;
     usb->zero_mask = zero_mask;
+    usb->writeable = 1;
 
     adb_cond_init(&usb->notify, 0);
     adb_mutex_init(&usb->lock, 0);
@@ -592,11 +612,69 @@ static void register_device(const char *dev_name,
     usb->mark = 1;
     usb->reaper_thread = 0;
 
-    usb->desc = unix_open(usb->fname, O_RDWR);
-    if(usb->desc < 0) goto fail;
-    D("[ usb open %s fd = %d]\n", usb->fname, usb->desc);
-    n = ioctl(usb->desc, USBDEVFS_CLAIMINTERFACE, &interface);
-    if(n != 0) goto fail;
+    usb->desc = unix_open(usb->fname, O_RDWR | O_CLOEXEC);
+    if(usb->desc < 0) {
+        /* if we fail, see if have read-only access */
+        usb->desc = unix_open(usb->fname, O_RDONLY | O_CLOEXEC);
+        if(usb->desc < 0) goto fail;
+        usb->writeable = 0;
+        D("[ usb open read-only %s fd = %d]\n", usb->fname, usb->desc);
+    } else {
+        D("[ usb open %s fd = %d]\n", usb->fname, usb->desc);
+        n = ioctl(usb->desc, USBDEVFS_CLAIMINTERFACE, &interface);
+        if(n != 0) goto fail;
+    }
+
+        /* read the device's serial number */
+    serial[0] = 0;
+    memset(serial, 0, sizeof(serial));
+    if (serial_index) {
+        struct usbdevfs_ctrltransfer  ctrl;
+        __u16 buffer[128];
+        __u16 languages[128];
+        int i, result;
+        int languageCount = 0;
+
+        memset(languages, 0, sizeof(languages));
+        memset(&ctrl, 0, sizeof(ctrl));
+
+            // read list of supported languages
+        ctrl.bRequestType = USB_DIR_IN|USB_TYPE_STANDARD|USB_RECIP_DEVICE;
+        ctrl.bRequest = USB_REQ_GET_DESCRIPTOR;
+        ctrl.wValue = (USB_DT_STRING << 8) | 0;
+        ctrl.wIndex = 0;
+        ctrl.wLength = sizeof(languages);
+        ctrl.data = languages;
+        ctrl.timeout = 1000;
+
+        result = ioctl(usb->desc, USBDEVFS_CONTROL, &ctrl);
+        if (result > 0)
+            languageCount = (result - 2) / 2;
+
+        for (i = 1; i <= languageCount; i++) {
+            memset(buffer, 0, sizeof(buffer));
+            memset(&ctrl, 0, sizeof(ctrl));
+
+            ctrl.bRequestType = USB_DIR_IN|USB_TYPE_STANDARD|USB_RECIP_DEVICE;
+            ctrl.bRequest = USB_REQ_GET_DESCRIPTOR;
+            ctrl.wValue = (USB_DT_STRING << 8) | serial_index;
+            ctrl.wIndex = __le16_to_cpu(languages[i]);
+            ctrl.wLength = sizeof(buffer);
+            ctrl.data = buffer;
+            ctrl.timeout = 1000;
+
+            result = ioctl(usb->desc, USBDEVFS_CONTROL, &ctrl);
+            if (result > 0) {
+                int i;
+                // skip first word, and copy the rest to the serial string, changing shorts to bytes.
+                result /= 2;
+                for (i = 1; i < result; i++)
+                    serial[i - 1] = __le16_to_cpu(buffer[i]);
+                serial[i - 1] = 0;
+                break;
+            }
+        }
+    }
 
         /* add to the end of the active handles */
     adb_mutex_lock(&usb_lock);
@@ -606,7 +684,7 @@ static void register_device(const char *dev_name,
     usb->next->prev = usb;
     adb_mutex_unlock(&usb_lock);
 
-    register_usb_transport(usb, serial);
+    register_usb_transport(usb, serial, devpath, usb->writeable);
     return;
 
 fail:
@@ -650,4 +728,3 @@ void usb_init()
         fatal_errno("cannot create input thread");
     }
 }
-

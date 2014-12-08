@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include <malloc.h>
 #include <errno.h>
+#include <sys/param.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -48,7 +49,8 @@ bail:
 int insmod_main(int argc, char **argv)
 {
 	void *file;
-	ssize_t size;
+	ssize_t size = 0;
+	char opts[1024];
 	int ret;
 
 	/* make sure we've got an argument */
@@ -64,9 +66,23 @@ int insmod_main(int argc, char **argv)
 		return -1;
 	}
 
+	opts[0] = '\0';
+	if (argc > 2) {
+		int i, len;
+		char *end = opts + sizeof(opts) - 1;
+		char *ptr = opts;
+
+		for (i = 2; (i < argc) && (ptr < end); i++) {
+			len = MIN(strlen(argv[i]), (size_t)(end - ptr));
+			memcpy(ptr, argv[i], len);
+			ptr += len;
+			*ptr++ = ' ';
+		}
+		*(ptr - 1) = '\0';
+	}
+
 	/* pass it to the kernel */
-	/* XXX options */
-	ret = init_module(file, size, "");
+	ret = init_module(file, size, opts);
 	if (ret != 0) {
 		fprintf(stderr,
                 "insmod: init_module '%s' failed (%s)\n",

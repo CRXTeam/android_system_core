@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 /* here's how these things work.
 
@@ -164,7 +165,7 @@ jdwp_process_free( JdwpProcess*  proc )
         proc->next->prev = proc->prev;
 
         if (proc->socket >= 0) {
-            shutdown(proc->socket, SHUT_RDWR);
+            adb_shutdown(proc->socket);
             adb_close(proc->socket);
             proc->socket = -1;
         }
@@ -287,7 +288,7 @@ jdwp_process_event( int  socket, unsigned  events, void*  _proc )
                 if (len <= 0) {
                     if (len < 0 && errno == EINTR)
                         continue;
-		    if (len < 0 && errno == EAGAIN)
+                    if (len < 0 && errno == EAGAIN)
                         return;
                     else {
                         D("terminating JDWP %d connection: %s\n", proc->pid,
@@ -295,7 +296,7 @@ jdwp_process_event( int  socket, unsigned  events, void*  _proc )
                         break;
                     }
                 }
-		else {
+                else {
                     D( "ignoring unexpected JDWP %d control socket activity (%d bytes)\n",
                        proc->pid, len );
                 }
@@ -320,6 +321,7 @@ jdwp_process_event( int  socket, unsigned  events, void*  _proc )
             struct iovec     iov;
             char             dummy = '!';
             char             buffer[sizeof(struct cmsghdr) + sizeof(int)];
+            int flags;
 
             iov.iov_base       = &dummy;
             iov.iov_len        = 1;
@@ -337,10 +339,27 @@ jdwp_process_event( int  socket, unsigned  events, void*  _proc )
             cmsg->cmsg_type  = SCM_RIGHTS;
             ((int*)CMSG_DATA(cmsg))[0] = fd;
 
+            flags = fcntl(proc->socket,F_GETFL,0);
+
+            if (flags == -1) {
+                D("failed to get cntl flags for socket %d: %s\n",
+                  proc->pid, strerror(errno));
+                goto CloseProcess;
+
+            }
+
+            if (fcntl(proc->socket, F_SETFL, flags & ~O_NONBLOCK) == -1) {
+                D("failed to remove O_NONBLOCK flag for socket %d: %s\n",
+                  proc->pid, strerror(errno));
+                goto CloseProcess;
+            }
+
             for (;;) {
                 ret = sendmsg(proc->socket, &msg, 0);
-                if (ret >= 0)
+                if (ret >= 0) {
+                    adb_close(fd);
                     break;
+                }
                 if (errno == EINTR)
                     continue;
                 D("sending new file descriptor to JDWP %d failed: %s\n",
@@ -353,6 +372,12 @@ jdwp_process_event( int  socket, unsigned  events, void*  _proc )
 
             for (n = 1; n < proc->out_count; n++)
                 proc->out_fds[n-1] = proc->out_fds[n];
+
+            if (fcntl(proc->socket, F_SETFL, flags) == -1) {
+                D("failed to set O_NONBLOCK flag for socket %d: %s\n",
+                  proc->pid, strerror(errno));
+                goto CloseProcess;
+            }
 
             if (--proc->out_count == 0)
                 fdevent_del( proc->fde, FDE_WRITE );
@@ -474,6 +499,7 @@ jdwp_control_init( JdwpControl*  control,
 
     /* only wait for incoming connections */
     fdevent_add(control->fde, FDE_READ);
+    close_on_exec(s);
 
     D("jdwp control socket started (%d)\n", control->listen_socket);
     return 0;

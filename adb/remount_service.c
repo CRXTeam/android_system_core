@@ -14,13 +14,13 @@
  * limitations under the License.
  */
 
-#include <stdlib.h>
-#include <stdio.h>
-#include <unistd.h>
-#include <string.h>
-#include <fcntl.h>
-#include <sys/mount.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/mount.h>
+#include <unistd.h>
 
 #include "sysdeps.h"
 
@@ -29,56 +29,82 @@
 
 
 static int system_ro = 1;
+static int vendor_ro = 1;
 
-/* Returns the mount number of the requested partition from /proc/mtd */
-static int find_mount(const char *findme)
+/* Returns the device used to mount a directory in /proc/mounts */
+static char *find_mount(const char *dir)
 {
     int fd;
     int res;
-    int size;
     char *token = NULL;
     const char delims[] = "\n";
-    char buf[1024];
+    char buf[4096];
 
-    fd = unix_open("/proc/mtd", O_RDONLY);
+    fd = unix_open("/proc/mounts", O_RDONLY | O_CLOEXEC);
     if (fd < 0)
-        return -errno;
+        return NULL;
 
     buf[sizeof(buf) - 1] = '\0';
-    size = adb_read(fd, buf, sizeof(buf) - 1);
+    adb_read(fd, buf, sizeof(buf) - 1);
     adb_close(fd);
 
     token = strtok(buf, delims);
 
     while (token) {
-        char mtdname[16];
-        int mtdnum, mtdsize, mtderasesize;
+        char mount_dev[256];
+        char mount_dir[256];
+        int mount_freq;
+        int mount_passno;
 
-        res = sscanf(token, "mtd%d: %x %x %15s",
-                     &mtdnum, &mtdsize, &mtderasesize, mtdname);
-
-        if (res == 4 && !strcmp(mtdname, findme))
-            return mtdnum;
+        res = sscanf(token, "%255s %255s %*s %*s %d %d\n",
+                     mount_dev, mount_dir, &mount_freq, &mount_passno);
+        mount_dev[255] = 0;
+        mount_dir[255] = 0;
+        if (res == 4 && (strcmp(dir, mount_dir) == 0))
+            return strdup(mount_dev);
 
         token = strtok(NULL, delims);
     }
-    return -1;
+    return NULL;
+}
+
+static int hasVendorPartition()
+{
+    struct stat info;
+    if (!lstat("/vendor", &info))
+        if ((info.st_mode & S_IFMT) == S_IFDIR)
+          return true;
+    return false;
 }
 
 /* Init mounts /system as read only, remount to enable writes. */
-static int remount_system()
+static int remount(const char* dir, int* dir_ro)
 {
-    int num;
-    char source[64];
-    if (system_ro == 0) {
+    char *dev;
+    int fd;
+    int OFF = 0;
+
+    if (dir_ro == 0) {
         return 0;
     }
-    if ((num = find_mount("\"system\"")) < 0)
+
+    dev = find_mount(dir);
+
+    if (!dev)
         return -1;
 
-    snprintf(source, sizeof source, "/dev/block/mtdblock%d", num);
-    system_ro = mount(source, "/system", "yaffs2", MS_REMOUNT, NULL);
-    return system_ro;
+    fd = unix_open(dev, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return -1;
+
+    ioctl(fd, BLKROSET, &OFF);
+    adb_close(fd);
+
+    *dir_ro = mount(dev, dir, "none", MS_REMOUNT, NULL);
+
+    free(dev);
+
+    return *dir_ro;
 }
 
 static void write_string(int fd, const char* str)
@@ -88,14 +114,23 @@ static void write_string(int fd, const char* str)
 
 void remount_service(int fd, void *cookie)
 {
-    int ret = remount_system();
-
-    if (!ret)
-       write_string(fd, "remount succeeded\n");
-    else {
-        char    buffer[200];
-        snprintf(buffer, sizeof(buffer), "remount failed: %s\n", strerror(errno));
+    char buffer[200];
+    if (remount("/system", &system_ro)) {
+        snprintf(buffer, sizeof(buffer), "remount of system failed: %s\n",strerror(errno));
         write_string(fd, buffer);
+    }
+
+    if (hasVendorPartition()) {
+        if (remount("/vendor", &vendor_ro)) {
+            snprintf(buffer, sizeof(buffer), "remount of vendor failed: %s\n",strerror(errno));
+            write_string(fd, buffer);
+        }
+    }
+
+    if (!system_ro && (!vendor_ro || !hasVendorPartition()))
+        write_string(fd, "remount succeeded\n");
+    else {
+        write_string(fd, "remount failed\n");
     }
 
     adb_close(fd);

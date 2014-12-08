@@ -9,7 +9,7 @@
  *    notice, this list of conditions and the following disclaimer.
  *  * Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in
- *    the documentation and/or other materials provided with the 
+ *    the documentation and/or other materials provided with the
  *    distribution.
  *  * Neither the name of Google, Inc. nor the names of its contributors
  *    may be used to endorse or promote products derived from this
@@ -22,7 +22,7 @@
  * COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
  * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
  * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
- * OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED 
+ * OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
  * AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
  * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
@@ -39,9 +39,16 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <cutils/sched_policy.h>
+
 struct cpu_info {
     long unsigned utime, ntime, stime, itime;
+    long unsigned iowtime, irqtime, sirqtime;
 };
+
+#define PROC_NAME_LEN 64
+#define THREAD_NAME_LEN 32
+#define POLICY_NAME_LEN 4
 
 struct proc_info {
     struct proc_info *next;
@@ -49,7 +56,8 @@ struct proc_info {
     pid_t tid;
     uid_t uid;
     gid_t gid;
-    char name[256];
+    char name[PROC_NAME_LEN];
+    char tname[THREAD_NAME_LEN];
     char state;
     long unsigned utime;
     long unsigned stime;
@@ -58,7 +66,9 @@ struct proc_info {
     long unsigned delta_time;
     long vss;
     long rss;
+    int prs;
     int num_threads;
+    char policy[POLICY_NAME_LEN];
 };
 
 struct proc_list {
@@ -69,7 +79,7 @@ struct proc_list {
 #define die(...) { fprintf(stderr, __VA_ARGS__); exit(EXIT_FAILURE); }
 
 #define INIT_PROCS 50
-#define THREAD_MULT 4
+#define THREAD_MULT 8
 static struct proc_info **old_procs, **new_procs;
 static int num_old_procs, num_new_procs;
 static struct proc_info *free_procs;
@@ -83,6 +93,7 @@ static struct proc_info *alloc_proc(void);
 static void free_proc(struct proc_info *proc);
 static void read_procs(void);
 static int read_stat(char *filename, struct proc_info *proc);
+static void read_policy(int pid, struct proc_info *proc);
 static void add_proc(int proc_num, struct proc_info *proc);
 static int read_cmdline(char *filename, struct proc_info *proc);
 static int read_status(char *filename, struct proc_info *proc);
@@ -97,16 +108,20 @@ static int proc_thr_cmp(const void *a, const void *b);
 static int numcmp(long long a, long long b);
 static void usage(char *cmd);
 
-int top_main(int argc, char *argv[]) {
-    int i;
+static void exit_top(int signal) {
+  exit(EXIT_FAILURE);
+}
 
+int top_main(int argc, char *argv[]) {
     num_used_procs = num_free_procs = 0;
+
+    signal(SIGPIPE, exit_top);
 
     max_procs = 0;
     delay = 3;
     iterations = -1;
     proc_cmp = &proc_cpu_cmp;
-    for (i = 1; i < argc; i++) {
+    for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-m")) {
             if (i + 1 >= argc) {
                 fprintf(stderr, "Option -m expects an argument.\n");
@@ -228,7 +243,8 @@ static void read_procs(void) {
 
     file = fopen("/proc/stat", "r");
     if (!file) die("Could not open /proc/stat.\n");
-    fscanf(file, "cpu  %lu %lu %lu %lu", &new_cpu.utime, &new_cpu.ntime, &new_cpu.stime, &new_cpu.itime);
+    fscanf(file, "cpu  %lu %lu %lu %lu %lu %lu %lu", &new_cpu.utime, &new_cpu.ntime, &new_cpu.stime,
+            &new_cpu.itime, &new_cpu.iowtime, &new_cpu.irqtime, &new_cpu.sirqtime);
     fclose(file);
 
     proc_num = 0;
@@ -237,6 +253,8 @@ static void read_procs(void) {
             continue;
 
         pid = atoi(pid_dir->d_name);
+
+        struct proc_info cur_proc;
 
         if (!threads) {
             proc = alloc_proc();
@@ -252,8 +270,16 @@ static void read_procs(void) {
             sprintf(filename, "/proc/%d/status", pid);
             read_status(filename, proc);
 
+            read_policy(pid, proc);
+
             proc->num_threads = 0;
         } else {
+            sprintf(filename, "/proc/%d/cmdline", pid);
+            read_cmdline(filename, &cur_proc);
+
+            sprintf(filename, "/proc/%d/status", pid);
+            read_status(filename, &cur_proc);
+
             proc = NULL;
         }
 
@@ -275,11 +301,11 @@ static void read_procs(void) {
                 sprintf(filename, "/proc/%d/task/%d/stat", pid, tid);
                 read_stat(filename, proc);
 
-                sprintf(filename, "/proc/%d/task/%d/cmdline", pid, tid);
-                read_cmdline(filename, proc);
+                read_policy(tid, proc);
 
-                sprintf(filename, "/proc/%d/task/%d/status", pid, tid);
-                read_status(filename, proc);
+                strcpy(proc->name, cur_proc.name);
+                proc->uid = cur_proc.uid;
+                proc->gid = cur_proc.gid;
 
                 add_proc(proc_num++, proc);
             } else {
@@ -288,7 +314,7 @@ static void read_procs(void) {
         }
 
         closedir(task_dir);
-        
+
         if (!threads)
             add_proc(proc_num++, proc);
     }
@@ -302,7 +328,6 @@ static void read_procs(void) {
 static int read_stat(char *filename, struct proc_info *proc) {
     FILE *file;
     char buf[MAX_LINE], *open_paren, *close_paren;
-    int res, idx;
 
     file = fopen(filename, "r");
     if (!file) return 1;
@@ -315,12 +340,14 @@ static int read_stat(char *filename, struct proc_info *proc) {
     if (!open_paren || !close_paren) return 1;
 
     *open_paren = *close_paren = '\0';
-    strcpy(proc->name, open_paren + 1);
+    strncpy(proc->tname, open_paren + 1, THREAD_NAME_LEN);
+    proc->tname[THREAD_NAME_LEN-1] = 0;
 
     /* Scan rest of string. */
     sscanf(close_paren + 1, " %c %*d %*d %*d %*d %*d %*d %*d %*d %*d %*d "
-                 "%lu %lu %*d %*d %*d %*d %*d %*d %*d %lu %ld",
-                 &proc->state, &proc->utime, &proc->stime, &proc->vss, &proc->rss);
+                 "%lu %lu %*d %*d %*d %*d %*d %*d %*d %lu %ld "
+                 "%*d %*d %*d %*d %*d %*d %*d %*d %*d %*d %*d %*d %*d %*d %d",
+                 &proc->state, &proc->utime, &proc->stime, &proc->vss, &proc->rss, &proc->prs);
 
     return 0;
 }
@@ -347,9 +374,22 @@ static int read_cmdline(char *filename, struct proc_info *proc) {
     if (!file) return 1;
     fgets(line, MAX_LINE, file);
     fclose(file);
-    if (strlen(line) > 0)
-        strcpy(proc->name, line);
+    if (strlen(line) > 0) {
+        strncpy(proc->name, line, PROC_NAME_LEN);
+        proc->name[PROC_NAME_LEN-1] = 0;
+    } else
+        proc->name[0] = 0;
     return 0;
+}
+
+static void read_policy(int pid, struct proc_info *proc) {
+    SchedPolicy p;
+    if (get_sched_policy(pid, &p) < 0)
+        strlcpy(proc->policy, "unk", POLICY_NAME_LEN);
+    else {
+        strlcpy(proc->policy, get_sched_policy_name(p), POLICY_NAME_LEN);
+        proc->policy[2] = '\0';
+    }
 }
 
 static int read_status(char *filename, struct proc_info *proc) {
@@ -373,9 +413,7 @@ static void print_procs(void) {
     struct proc_info *old_proc, *proc;
     long unsigned total_delta_time;
     struct passwd *user;
-    struct group *group;
     char *user_str, user_buf[20];
-    char *group_str, group_buf[20];
 
     for (i = 0; i < num_new_procs; i++) {
         if (new_procs[i]) {
@@ -391,16 +429,34 @@ static void print_procs(void) {
         }
     }
 
-    total_delta_time = (new_cpu.utime + new_cpu.ntime + new_cpu.stime + new_cpu.itime)
-                     - (old_cpu.utime + old_cpu.ntime + old_cpu.stime + old_cpu.itime);
+    total_delta_time = (new_cpu.utime + new_cpu.ntime + new_cpu.stime + new_cpu.itime
+                        + new_cpu.iowtime + new_cpu.irqtime + new_cpu.sirqtime)
+                     - (old_cpu.utime + old_cpu.ntime + old_cpu.stime + old_cpu.itime
+                        + old_cpu.iowtime + old_cpu.irqtime + old_cpu.sirqtime);
 
     qsort(new_procs, num_new_procs, sizeof(struct proc_info *), proc_cmp);
 
     printf("\n\n\n");
-    if (!threads) 
-        printf("%5s %4s %1s %5s %7s %7s %-8s %s\n", "PID", "CPU%", "S", "#THR", "VSS", "RSS", "UID", "Name");
+    printf("User %ld%%, System %ld%%, IOW %ld%%, IRQ %ld%%\n",
+            ((new_cpu.utime + new_cpu.ntime) - (old_cpu.utime + old_cpu.ntime)) * 100  / total_delta_time,
+            ((new_cpu.stime ) - (old_cpu.stime)) * 100 / total_delta_time,
+            ((new_cpu.iowtime) - (old_cpu.iowtime)) * 100 / total_delta_time,
+            ((new_cpu.irqtime + new_cpu.sirqtime)
+                    - (old_cpu.irqtime + old_cpu.sirqtime)) * 100 / total_delta_time);
+    printf("User %ld + Nice %ld + Sys %ld + Idle %ld + IOW %ld + IRQ %ld + SIRQ %ld = %ld\n",
+            new_cpu.utime - old_cpu.utime,
+            new_cpu.ntime - old_cpu.ntime,
+            new_cpu.stime - old_cpu.stime,
+            new_cpu.itime - old_cpu.itime,
+            new_cpu.iowtime - old_cpu.iowtime,
+            new_cpu.irqtime - old_cpu.irqtime,
+            new_cpu.sirqtime - old_cpu.sirqtime,
+            total_delta_time);
+    printf("\n");
+    if (!threads)
+        printf("%5s %2s %4s %1s %5s %7s %7s %3s %-8s %s\n", "PID", "PR", "CPU%", "S", "#THR", "VSS", "RSS", "PCY", "UID", "Name");
     else
-        printf("%5s %5s %4s %1s %7s %7s %-8s %s\n", "PID", "TID", "CPU%", "S", "VSS", "RSS", "UID", "Name");
+        printf("%5s %5s %2s %4s %1s %7s %7s %3s %-8s %-15s %s\n", "PID", "TID", "PR", "CPU%", "S", "VSS", "RSS", "PCY", "UID", "Thread", "Proc");
 
     for (i = 0; i < num_new_procs; i++) {
         proc = new_procs[i];
@@ -408,25 +464,18 @@ static void print_procs(void) {
         if (!proc || (max_procs && (i >= max_procs)))
             break;
         user  = getpwuid(proc->uid);
-        group = getgrgid(proc->gid);
         if (user && user->pw_name) {
             user_str = user->pw_name;
         } else {
             snprintf(user_buf, 20, "%d", proc->uid);
             user_str = user_buf;
         }
-        if (group && group->gr_name) {
-            group_str = group->gr_name;
-        } else {
-            snprintf(group_buf, 20, "%d", proc->gid);
-            group_str = group_buf;
-        }
-        if (!threads) 
-            printf("%5d %3ld%% %c %5d %6ldK %6ldK %-8.8s %s\n", proc->pid, proc->delta_time * 100 / total_delta_time, proc->state, proc->num_threads,
-                proc->vss / 1024, proc->rss * getpagesize() / 1024, user_str, proc->name);
+        if (!threads)
+            printf("%5d %2d %3ld%% %c %5d %6ldK %6ldK %3s %-8.8s %s\n", proc->pid, proc->prs, proc->delta_time * 100 / total_delta_time, proc->state, proc->num_threads,
+                proc->vss / 1024, proc->rss * getpagesize() / 1024, proc->policy, user_str, proc->name[0] != 0 ? proc->name : proc->tname);
         else
-            printf("%5d %5d %3ld%% %c %6ldK %6ldK %-8.8s %s\n", proc->pid, proc->tid, proc->delta_time * 100 / total_delta_time, proc->state,
-                proc->vss / 1024, proc->rss * getpagesize() / 1024, user_str, proc->name);
+            printf("%5d %5d %2d %3ld%% %c %6ldK %6ldK %3s %-8.8s %-15s %s\n", proc->pid, proc->tid, proc->prs, proc->delta_time * 100 / total_delta_time, proc->state,
+                proc->vss / 1024, proc->rss * getpagesize() / 1024, proc->policy, user_str, proc->tname, proc->name);
     }
 }
 

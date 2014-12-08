@@ -1,6 +1,6 @@
 #include "sysdeps.h"
-#include <windows.h>
 #include <winsock2.h>
+#include <windows.h>
 #include <stdio.h>
 #include <errno.h>
 #define  TRACE_TAG  TRACE_SYSDEPS
@@ -352,7 +352,7 @@ int  adb_open(const char*  path, int  options)
                 return -1;
         }
     }
-    
+
     snprintf( f->name, sizeof(f->name), "%d(%s)", _fh_to_int(f), path );
     D( "adb_open: '%s' => fd %d\n", path, _fh_to_int(f) );
     return _fh_to_int(f);
@@ -432,6 +432,20 @@ int  adb_lseek(int  fd, int  pos, int  where)
     }
 
     return f->clazz->_fh_lseek(f, pos, where);
+}
+
+
+int  adb_shutdown(int  fd)
+{
+    FH   f = _fh_from_int(fd);
+
+    if (!f) {
+        return -1;
+    }
+
+    D( "adb_shutdown: %s\n", f->name);
+    shutdown( f->fh_socket, SD_BOTH );
+    return 0;
 }
 
 
@@ -687,6 +701,13 @@ int socket_network_client(const char *host, int port, int type)
 }
 
 
+int socket_network_client_timeout(const char *host, int port, int type, int timeout)
+{
+    // TODO: implement timeouts for Windows.
+    return socket_network_client(host, port, type);
+}
+
+
 int socket_inaddr_any_server(int port, int type)
 {
     FH  f = _fh_alloc( &_fh_socket_class );
@@ -739,12 +760,12 @@ int  adb_socket_accept(int  serverfd, struct sockaddr*  addr, socklen_t  *addrle
 {
     FH   serverfh = _fh_from_int(serverfd);
     FH   fh;
-    
+
     if ( !serverfh || serverfh->clazz != &_fh_socket_class ) {
         D( "adb_socket_accept: invalid fd %d\n", serverfd );
         return -1;
     }
-    
+
     fh = _fh_alloc( &_fh_socket_class );
     if (!fh) {
         D( "adb_socket_accept: not enough memory to allocate accepted socket descriptor\n" );
@@ -757,7 +778,7 @@ int  adb_socket_accept(int  serverfd, struct sockaddr*  addr, socklen_t  *addrle
         D( "adb_socket_accept: accept on fd %d return error %ld\n", serverfd, GetLastError() );
         return -1;
     }
-    
+
     snprintf( fh->name, sizeof(fh->name), "%d(accept:%s)", _fh_to_int(fh), serverfh->name );
     D( "adb_socket_accept on fd %d returns fd %d\n", serverfd, _fh_to_int(fh) );
     return  _fh_to_int(fh);
@@ -767,8 +788,8 @@ int  adb_socket_accept(int  serverfd, struct sockaddr*  addr, socklen_t  *addrle
 void  disable_tcp_nagle(int fd)
 {
     FH   fh = _fh_from_int(fd);
-    int  on;
-    
+    int  on = 1;
+
     if ( !fh || fh->clazz != &_fh_socket_class )
         return;
 
@@ -823,7 +844,7 @@ static void  bip_dump_hex( const unsigned char*  ptr, size_t  len )
 
     if (len2 > 8) len2 = 8;
 
-    for (nn = 0; nn < len2; nn++) 
+    for (nn = 0; nn < len2; nn++)
         printf("%02x", ptr[nn]);
     printf("  ");
 
@@ -940,12 +961,12 @@ bip_buffer_write( BipBuffer  bip, const void* src, int  len )
         /* we can append to region A */
         if (avail > len)
             avail = len;
-         
+
         memcpy( bip->buff + bip->a_end, src, avail );
-        src   += avail;
+        src   = (const char *)src + avail;
         count += avail;
         len   -= avail;
-     
+
         bip->a_end += avail;
         if (bip->a_end == BIP_BUFFER_SIZE && bip->a_start == 0) {
             bip->can_write = 0;
@@ -953,25 +974,25 @@ bip_buffer_write( BipBuffer  bip, const void* src, int  len )
             goto Exit;
         }
     }
-    
+
     if (len == 0)
         goto Exit;
 
     avail = bip->a_start - bip->b_end;
     assert( avail > 0 );  /* since can_write is TRUE */
-    
+
     if (avail > len)
         avail = len;
-        
+
     memcpy( bip->buff + bip->b_end, src, avail );
     count += avail;
     bip->b_end += avail;
-    
+
     if (bip->b_end == bip->a_start) {
         bip->can_write = 0;
         ResetEvent( bip->evt_write );
     }
-    
+
 Exit:
     assert( count > 0 );
 
@@ -979,8 +1000,8 @@ Exit:
         bip->can_read = 1;
         SetEvent( bip->evt_read );
     }
-  
-    BIPD(( "bip_buffer_write: exit %d->%d count %d (as=%d ae=%d be=%d cw=%d cr=%d\n", 
+
+    BIPD(( "bip_buffer_write: exit %d->%d count %d (as=%d ae=%d be=%d cw=%d cr=%d\n",
             bip->fdin, bip->fdout, count, bip->a_start, bip->a_end, bip->b_end, bip->can_write, bip->can_read ));
     LeaveCriticalSection( &bip->lock );
 
@@ -991,12 +1012,12 @@ static int
 bip_buffer_read( BipBuffer  bip, void*  dst, int  len )
 {
     int  avail, count = 0;
-    
+
     if (len <= 0)
         return 0;
-    
+
     BIPD(( "bip_buffer_read: enter %d->%d len %d\n", bip->fdin, bip->fdout, len ));
-    
+
     EnterCriticalSection( &bip->lock );
     while ( !bip->can_read )
     {
@@ -1004,10 +1025,10 @@ bip_buffer_read( BipBuffer  bip, void*  dst, int  len )
         LeaveCriticalSection( &bip->lock );
         errno = EAGAIN;
         return -1;
-#else    
+#else
         int  ret;
         LeaveCriticalSection( &bip->lock );
-        
+
         if (bip->closed) {
             errno = EPIPE;
             return -1;
@@ -1023,30 +1044,30 @@ bip_buffer_read( BipBuffer  bip, void*  dst, int  len )
             return -1;
         }
         EnterCriticalSection( &bip->lock );
-#endif        
+#endif
     }
 
     BIPD(( "bip_buffer_read: exec %d->%d len %d\n", bip->fdin, bip->fdout, len ));
-   
+
     avail = bip->a_end - bip->a_start;
     assert( avail > 0 );  /* since can_read is TRUE */
-    
+
     if (avail > len)
         avail = len;
-    
+
     memcpy( dst, bip->buff + bip->a_start, avail );
-    dst   += avail;
+    dst   = (char *)dst + avail;
     count += avail;
     len   -= avail;
-    
+
     bip->a_start += avail;
     if (bip->a_start < bip->a_end)
         goto Exit;
-    
+
     bip->a_start = 0;
     bip->a_end   = bip->b_end;
     bip->b_end   = 0;
-    
+
     avail = bip->a_end;
     if (avail > 0) {
         if (avail > len)
@@ -1054,13 +1075,13 @@ bip_buffer_read( BipBuffer  bip, void*  dst, int  len )
         memcpy( dst, bip->buff, avail );
         count += avail;
         bip->a_start += avail;
-        
+
         if ( bip->a_start < bip->a_end )
             goto Exit;
-            
+
         bip->a_start = bip->a_end = 0;
     }
-    
+
     bip->can_read = 0;
     ResetEvent( bip->evt_read );
 
@@ -1071,22 +1092,22 @@ Exit:
         bip->can_write = 1;
         SetEvent( bip->evt_write );
     }
-    
+
     BIPDUMP( (const unsigned char*)dst - count, count );
-    BIPD(( "bip_buffer_read: exit %d->%d count %d (as=%d ae=%d be=%d cw=%d cr=%d\n", 
+    BIPD(( "bip_buffer_read: exit %d->%d count %d (as=%d ae=%d be=%d cw=%d cr=%d\n",
             bip->fdin, bip->fdout, count, bip->a_start, bip->a_end, bip->b_end, bip->can_write, bip->can_read ));
     LeaveCriticalSection( &bip->lock );
-    
+
     return count;
 }
- 
-typedef struct SocketPairRec_ 
+
+typedef struct SocketPairRec_
 {
     BipBufferRec  a2b_bip;
     BipBufferRec  b2a_bip;
     FH            a_fd;
     int           used;
-    
+
 } SocketPairRec;
 
 void _fh_socketpair_init( FH  f )
@@ -1103,7 +1124,7 @@ _fh_socketpair_close( FH  f )
         if ( f == pair->a_fd ) {
             pair->a_fd = NULL;
         }
-        
+
         bip_buffer_close( &pair->b2a_bip );
         bip_buffer_close( &pair->a2b_bip );
 
@@ -1199,7 +1220,7 @@ int  adb_socketpair( int  sv[2] )
 
     sv[0] = _fh_to_int(fa);
     sv[1] = _fh_to_int(fb);
-    
+
     pair->a2b_bip.fdin  = sv[0];
     pair->a2b_bip.fdout = sv[1];
     pair->b2a_bip.fdin  = sv[1];
@@ -1303,7 +1324,7 @@ event_hook_alloc( FH  fh )
     hook->stop    = NULL;
     hook->check   = NULL;
     hook->peek    = NULL;
-    
+
     return hook;
 }
 
@@ -1324,7 +1345,7 @@ event_hook_signal( EventHook  hook )
     FH        f   = hook->fh;
     int       fd  = _fh_to_int(f);
     fdevent*  fde = fd_table[ fd - WIN32_FH_BASE ];
-    
+
     if (fde != NULL && fde->fd == fd) {
         if ((fde->state & FDE_PENDING) == 0) {
             fde->state |= FDE_PENDING;
@@ -1365,7 +1386,7 @@ event_looper_hook( EventLooper  looper, int  fd, int  events )
     FH          f = _fh_from_int(fd);
     EventHook  *pnode;
     EventHook   node;
-    
+
     if (f == NULL)  /* invalid arg */ {
         D("event_looper_hook: invalid fd=%d\n", fd);
         return;
@@ -1386,7 +1407,7 @@ event_looper_hook( EventLooper  looper, int  fd, int  events )
         f->clazz->_fh_hook( f, events & ~node->wanted, node );
         node->wanted |= events;
     } else {
-        D("event_looper_hook: ignoring events %x for %d wanted=%x)\n", 
+        D("event_looper_hook: ignoring events %x for %d wanted=%x)\n",
            events, fd, node->wanted);
     }
 }
@@ -1397,7 +1418,7 @@ event_looper_unhook( EventLooper  looper, int  fd, int  events )
     FH          fh    = _fh_from_int(fd);
     EventHook  *pnode = event_looper_find_p( looper, fh );
     EventHook   node  = *pnode;
-    
+
     if (node != NULL) {
         int  events2 = events & node->wanted;
         if ( events2 == 0 ) {
@@ -1412,6 +1433,180 @@ event_looper_unhook( EventLooper  looper, int  fd, int  events )
     }
 }
 
+/*
+ * A fixer for WaitForMultipleObjects on condition that there are more than 64
+ * handles to wait on.
+ *
+ * In cetain cases DDMS may establish more than 64 connections with ADB. For
+ * instance, this may happen if there are more than 64 processes running on a
+ * device, or there are multiple devices connected (including the emulator) with
+ * the combined number of running processes greater than 64. In this case using
+ * WaitForMultipleObjects to wait on connection events simply wouldn't cut,
+ * because of the API limitations (64 handles max). So, we need to provide a way
+ * to scale WaitForMultipleObjects to accept an arbitrary number of handles. The
+ * easiest (and "Microsoft recommended") way to do that would be dividing the
+ * handle array into chunks with the chunk size less than 64, and fire up as many
+ * waiting threads as there are chunks. Then each thread would wait on a chunk of
+ * handles, and will report back to the caller which handle has been set.
+ * Here is the implementation of that algorithm.
+ */
+
+/* Number of handles to wait on in each wating thread. */
+#define WAIT_ALL_CHUNK_SIZE 63
+
+/* Descriptor for a wating thread */
+typedef struct WaitForAllParam {
+    /* A handle to an event to signal when waiting is over. This handle is shared
+     * accross all the waiting threads, so each waiting thread knows when any
+     * other thread has exited, so it can exit too. */
+    HANDLE          main_event;
+    /* Upon exit from a waiting thread contains the index of the handle that has
+     * been signaled. The index is an absolute index of the signaled handle in
+     * the original array. This pointer is shared accross all the waiting threads
+     * and it's not guaranteed (due to a race condition) that when all the
+     * waiting threads exit, the value contained here would indicate the first
+     * handle that was signaled. This is fine, because the caller cares only
+     * about any handle being signaled. It doesn't care about the order, nor
+     * about the whole list of handles that were signaled. */
+    LONG volatile   *signaled_index;
+    /* Array of handles to wait on in a waiting thread. */
+    HANDLE*         handles;
+    /* Number of handles in 'handles' array to wait on. */
+    int             handles_count;
+    /* Index inside the main array of the first handle in the 'handles' array. */
+    int             first_handle_index;
+    /* Waiting thread handle. */
+    HANDLE          thread;
+} WaitForAllParam;
+
+/* Waiting thread routine. */
+static unsigned __stdcall
+_in_waiter_thread(void*  arg)
+{
+    HANDLE wait_on[WAIT_ALL_CHUNK_SIZE + 1];
+    int res;
+    WaitForAllParam* const param = (WaitForAllParam*)arg;
+
+    /* We have to wait on the main_event in order to be notified when any of the
+     * sibling threads is exiting. */
+    wait_on[0] = param->main_event;
+    /* The rest of the handles go behind the main event handle. */
+    memcpy(wait_on + 1, param->handles, param->handles_count * sizeof(HANDLE));
+
+    res = WaitForMultipleObjects(param->handles_count + 1, wait_on, FALSE, INFINITE);
+    if (res > 0 && res < (param->handles_count + 1)) {
+        /* One of the original handles got signaled. Save its absolute index into
+         * the output variable. */
+        InterlockedCompareExchange(param->signaled_index,
+                                   res - 1L + param->first_handle_index, -1L);
+    }
+
+    /* Notify the caller (and the siblings) that the wait is over. */
+    SetEvent(param->main_event);
+
+    _endthreadex(0);
+    return 0;
+}
+
+/* WaitForMultipeObjects fixer routine.
+ * Param:
+ *  handles Array of handles to wait on.
+ *  handles_count Number of handles in the array.
+ * Return:
+ *  (>= 0 && < handles_count) - Index of the signaled handle in the array, or
+ *  WAIT_FAILED on an error.
+ */
+static int
+_wait_for_all(HANDLE* handles, int handles_count)
+{
+    WaitForAllParam* threads;
+    HANDLE main_event;
+    int chunks, chunk, remains;
+
+    /* This variable is going to be accessed by several threads at the same time,
+     * this is bound to fail randomly when the core is run on multi-core machines.
+     * To solve this, we need to do the following (1 _and_ 2):
+     * 1. Use the "volatile" qualifier to ensure the compiler doesn't optimize
+     *    out the reads/writes in this function unexpectedly.
+     * 2. Ensure correct memory ordering. The "simple" way to do that is to wrap
+     *    all accesses inside a critical section. But we can also use
+     *    InterlockedCompareExchange() which always provide a full memory barrier
+     *    on Win32.
+     */
+    volatile LONG sig_index = -1;
+
+    /* Calculate number of chunks, and allocate thread param array. */
+    chunks = handles_count / WAIT_ALL_CHUNK_SIZE;
+    remains = handles_count % WAIT_ALL_CHUNK_SIZE;
+    threads = (WaitForAllParam*)malloc((chunks + (remains ? 1 : 0)) *
+                                        sizeof(WaitForAllParam));
+    if (threads == NULL) {
+        D("Unable to allocate thread array for %d handles.", handles_count);
+        return (int)WAIT_FAILED;
+    }
+
+    /* Create main event to wait on for all waiting threads. This is a "manualy
+     * reset" event that will remain set once it was set. */
+    main_event = CreateEvent(NULL, TRUE, FALSE, NULL);
+    if (main_event == NULL) {
+        D("Unable to create main event. Error: %d", (int)GetLastError());
+        free(threads);
+        return (int)WAIT_FAILED;
+    }
+
+    /*
+     * Initialize waiting thread parameters.
+     */
+
+    for (chunk = 0; chunk < chunks; chunk++) {
+        threads[chunk].main_event = main_event;
+        threads[chunk].signaled_index = &sig_index;
+        threads[chunk].first_handle_index = WAIT_ALL_CHUNK_SIZE * chunk;
+        threads[chunk].handles = handles + threads[chunk].first_handle_index;
+        threads[chunk].handles_count = WAIT_ALL_CHUNK_SIZE;
+    }
+    if (remains) {
+        threads[chunk].main_event = main_event;
+        threads[chunk].signaled_index = &sig_index;
+        threads[chunk].first_handle_index = WAIT_ALL_CHUNK_SIZE * chunk;
+        threads[chunk].handles = handles + threads[chunk].first_handle_index;
+        threads[chunk].handles_count = remains;
+        chunks++;
+    }
+
+    /* Start the waiting threads. */
+    for (chunk = 0; chunk < chunks; chunk++) {
+        /* Note that using adb_thread_create is not appropriate here, since we
+         * need a handle to wait on for thread termination. */
+        threads[chunk].thread = (HANDLE)_beginthreadex(NULL, 0, _in_waiter_thread,
+                                                       &threads[chunk], 0, NULL);
+        if (threads[chunk].thread == NULL) {
+            /* Unable to create a waiter thread. Collapse. */
+            D("Unable to create a waiting thread %d of %d. errno=%d",
+              chunk, chunks, errno);
+            chunks = chunk;
+            SetEvent(main_event);
+            break;
+        }
+    }
+
+    /* Wait on any of the threads to get signaled. */
+    WaitForSingleObject(main_event, INFINITE);
+
+    /* Wait on all the waiting threads to exit. */
+    for (chunk = 0; chunk < chunks; chunk++) {
+        WaitForSingleObject(threads[chunk].thread, INFINITE);
+        CloseHandle(threads[chunk].thread);
+    }
+
+    CloseHandle(main_event);
+    free(threads);
+
+
+    const int ret = (int)InterlockedCompareExchange(&sig_index, -1, -1);
+    return (ret >= 0) ? ret : (int)WAIT_FAILED;
+}
+
 static EventLooperRec  win32_looper;
 
 static void fdevent_init(void)
@@ -1424,7 +1619,7 @@ static void fdevent_connect(fdevent *fde)
 {
     EventLooper  looper = &win32_looper;
     int          events = fde->state & FDE_EVENTMASK;
-    
+
     if (events != 0)
         event_looper_hook( looper, fde->fd, events );
 }
@@ -1433,7 +1628,7 @@ static void fdevent_disconnect(fdevent *fde)
 {
     EventLooper  looper = &win32_looper;
     int          events = fde->state & FDE_EVENTMASK;
-    
+
     if (events != 0)
         event_looper_unhook( looper, fde->fd, events );
 }
@@ -1462,7 +1657,7 @@ static void fdevent_process()
     EventLooper  looper = &win32_looper;
     EventHook    hook;
     int          gotone = 0;
-    
+
     /* if we have at least one ready hook, execute it/them */
     for (hook = looper->hooks; hook; hook = hook->next) {
         hook->ready = 0;
@@ -1479,8 +1674,8 @@ static void fdevent_process()
     if (!gotone)
     {
         looper->htab_count = 0;
-            
-        for (hook = looper->hooks; hook; hook = hook->next) 
+
+        for (hook = looper->hooks; hook; hook = hook->next)
         {
             if (hook->start && !hook->start(hook)) {
                 D( "fdevent_process: error when starting a hook\n" );
@@ -1511,15 +1706,16 @@ static void fdevent_process()
 
             D( "adb_win32: waiting for %d events\n", looper->htab_count );
             if (looper->htab_count > MAXIMUM_WAIT_OBJECTS) {
-                D("handle count %d exceeds MAXIMUM_WAIT_OBJECTS, aborting!\n", looper->htab_count);
-                abort();
+                D("handle count %d exceeds MAXIMUM_WAIT_OBJECTS.\n", looper->htab_count);
+                wait_ret = _wait_for_all(looper->htab, looper->htab_count);
+            } else {
+                wait_ret = WaitForMultipleObjects( looper->htab_count, looper->htab, FALSE, INFINITE );
             }
-            wait_ret = WaitForMultipleObjects( looper->htab_count, looper->htab, FALSE, INFINITE );
             if (wait_ret == (int)WAIT_FAILED) {
                 D( "adb_win32: wait failed, error %ld\n", GetLastError() );
             } else {
                 D( "adb_win32: got one (index %d)\n", wait_ret );
-            
+
                 /* according to Cygwin, some objects like consoles wake up on "inappropriate" events
                  * like mouse movements. we need to filter these with the "check" function
                  */
@@ -1561,7 +1757,7 @@ static void fdevent_register(fdevent *fde)
     if(fd < 0) {
         FATAL("bogus negative fd (%d)\n", fde->fd);
     }
-    
+
     if(fd >= fd_table_max) {
         int oldmax = fd_table_max;
         if(fde->fd > 32000) {
@@ -1587,7 +1783,7 @@ static void fdevent_register(fdevent *fde)
 static void fdevent_unregister(fdevent *fde)
 {
     int  fd = fde->fd - WIN32_FH_BASE;
-    
+
     if((fd < 0) || (fd >= fd_table_max)) {
         FATAL("fd out of range (%d)\n", fde->fd);
     }
@@ -1626,9 +1822,9 @@ static fdevent *fdevent_plist_dequeue(void)
 {
     fdevent *list = &list_pending;
     fdevent *node = list->next;
-    
+
     if(node == list) return 0;
-    
+
     list->next = node->next;
     list->next->prev = list;
     node->next = 0;
@@ -1655,7 +1851,7 @@ void fdevent_destroy(fdevent *fde)
     fdevent_remove(fde);
 }
 
-void fdevent_install(fdevent *fde, int fd, fd_func func, void *arg) 
+void fdevent_install(fdevent *fde, int fd, fd_func func, void *arg)
 {
     memset(fde, 0, sizeof(fdevent));
     fde->state = FDE_ACTIVE;
@@ -1677,7 +1873,7 @@ void fdevent_remove(fdevent *fde)
 
     if(fde->state & FDE_ACTIVE) {
         fdevent_disconnect(fde);
-        dump_fde(fde, "disconnect");    
+        dump_fde(fde, "disconnect");
         fdevent_unregister(fde);
     }
 
@@ -1689,9 +1885,9 @@ void fdevent_remove(fdevent *fde)
 void fdevent_set(fdevent *fde, unsigned events)
 {
     events &= FDE_EVENTMASK;
-    
+
     if((fde->state & FDE_EVENTMASK) == (int)events) return;
-    
+
     if(fde->state & FDE_ACTIVE) {
         fdevent_update(fde, events);
         dump_fde(fde, "update");
@@ -1727,13 +1923,13 @@ void fdevent_del(fdevent *fde, unsigned events)
 void fdevent_loop()
 {
     fdevent *fde;
-    
+
     for(;;) {
 #if DEBUG
         fprintf(stderr,"--- ---- waiting for events\n");
 #endif
         fdevent_process();
-        
+
         while((fde = fdevent_plist_dequeue())) {
             unsigned events = fde->events;
             fde->events = 0;
@@ -1746,7 +1942,7 @@ void fdevent_loop()
 
 /**  FILE EVENT HOOKS
  **/
- 
+
 static void  _event_file_prepare( EventHook  hook )
 {
     if (hook->wanted & (FDE_READ|FDE_WRITE)) {
@@ -1793,7 +1989,7 @@ static void  _event_socket_verify( EventHook  hook, WSANETWORKEVENTS*  evts )
 static void  _event_socket_prepare( EventHook  hook )
 {
     WSANETWORKEVENTS  evts;
-    
+
     /* look if some of the events we want already happened ? */
     if (!WSAEnumNetworkEvents( hook->fh->fh_socket, NULL, &evts ))
         _event_socket_verify( hook, &evts );
@@ -1819,13 +2015,13 @@ static int _event_socket_start( EventHook  hook )
     /* create an event which we're going to wait for */
     FH    fh    = hook->fh;
     long  flags = _socket_wanted_to_flags( hook->wanted );
-    
+
     hook->h = fh->event;
     if (hook->h == INVALID_HANDLE_VALUE) {
         D( "_event_socket_start: no event for %s\n", fh->name );
         return 0;
     }
-    
+
     if ( flags != fh->mask ) {
         D( "_event_socket_start: hooking %s for %x (flags %ld)\n", hook->fh->name, hook->wanted, flags );
         if ( WSAEventSelect( fh->fh_socket, hook->h, flags ) ) {
@@ -1850,7 +2046,7 @@ static int  _event_socket_check( EventHook  hook )
     int               result = 0;
     FH                fh = hook->fh;
     WSANETWORKEVENTS  evts;
-    
+
     if (!WSAEnumNetworkEvents( fh->fh_socket, hook->h, &evts ) ) {
         _event_socket_verify( hook, &evts );
         result = (hook->ready != 0);
@@ -1866,7 +2062,7 @@ static int  _event_socket_peek( EventHook  hook )
 {
     WSANETWORKEVENTS  evts;
     FH                fh = hook->fh;
-    
+
     /* look if some of the events we want already happened ? */
     if (!WSAEnumNetworkEvents( fh->fh_socket, NULL, &evts )) {
         _event_socket_verify( hook, &evts );
@@ -1886,45 +2082,45 @@ static void  _fh_socket_hook( FH  f, int  events, EventHook  hook )
     hook->stop    = _event_socket_stop;
     hook->check   = _event_socket_check;
     hook->peek    = _event_socket_peek;
-    
+
     _event_socket_start( hook );
 }
 
 /** SOCKETPAIR EVENT HOOKS
  **/
- 
+
 static void  _event_socketpair_prepare( EventHook  hook )
 {
     FH          fh   = hook->fh;
     SocketPair  pair = fh->fh_pair;
     BipBuffer   rbip = (pair->a_fd == fh) ? &pair->b2a_bip : &pair->a2b_bip;
     BipBuffer   wbip = (pair->a_fd == fh) ? &pair->a2b_bip : &pair->b2a_bip;
-   
+
     if (hook->wanted & FDE_READ && rbip->can_read)
         hook->ready |= FDE_READ;
-    
-    if (hook->wanted & FDE_WRITE && wbip->can_write) 
+
+    if (hook->wanted & FDE_WRITE && wbip->can_write)
         hook->ready |= FDE_WRITE;
  }
- 
+
  static int  _event_socketpair_start( EventHook  hook )
  {
     FH          fh   = hook->fh;
     SocketPair  pair = fh->fh_pair;
     BipBuffer   rbip = (pair->a_fd == fh) ? &pair->b2a_bip : &pair->a2b_bip;
     BipBuffer   wbip = (pair->a_fd == fh) ? &pair->a2b_bip : &pair->b2a_bip;
-    
+
     if (hook->wanted == FDE_READ)
         hook->h = rbip->evt_read;
-        
+
     else if (hook->wanted == FDE_WRITE)
         hook->h = wbip->evt_write;
-    
+
     else {
         D("_event_socketpair_start: can't handle FDE_READ+FDE_WRITE\n" );
         return 0;
     }
-    D( "_event_socketpair_start: hook %s for %x wanted=%x\n", 
+    D( "_event_socketpair_start: hook %s for %x wanted=%x\n",
        hook->fh->name, _fh_to_int(fh), hook->wanted);
     return 1;
 }
@@ -1951,3 +2147,81 @@ adb_sysdeps_init( void )
     InitializeCriticalSection( &_win32_lock );
 }
 
+/* Windows doesn't have strtok_r.  Use the one from bionic. */
+
+/*
+ * Copyright (c) 1988 Regents of the University of California.
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions
+ * are met:
+ * 1. Redistributions of source code must retain the above copyright
+ *    notice, this list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright
+ *    notice, this list of conditions and the following disclaimer in the
+ *    documentation and/or other materials provided with the distribution.
+ * 3. Neither the name of the University nor the names of its contributors
+ *    may be used to endorse or promote products derived from this software
+ *    without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ * ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+ * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+ * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+ * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+ * SUCH DAMAGE.
+ */
+
+char *
+adb_strtok_r(char *s, const char *delim, char **last)
+{
+	char *spanp;
+	int c, sc;
+	char *tok;
+
+
+	if (s == NULL && (s = *last) == NULL)
+		return (NULL);
+
+	/*
+	 * Skip (span) leading delimiters (s += strspn(s, delim), sort of).
+	 */
+cont:
+	c = *s++;
+	for (spanp = (char *)delim; (sc = *spanp++) != 0;) {
+		if (c == sc)
+			goto cont;
+	}
+
+	if (c == 0) {		/* no non-delimiter characters */
+		*last = NULL;
+		return (NULL);
+	}
+	tok = s - 1;
+
+	/*
+	 * Scan token (scan for delimiters: s += strcspn(s, delim), sort of).
+	 * Note that delim must have one NUL; we stop if we see that, too.
+	 */
+	for (;;) {
+		c = *s++;
+		spanp = (char *)delim;
+		do {
+			if ((sc = *spanp++) == c) {
+				if (c == 0)
+					s = NULL;
+				else
+					s[-1] = 0;
+				*last = s;
+				return (tok);
+			}
+		} while (sc != 0);
+	}
+	/* NOTREACHED */
+}

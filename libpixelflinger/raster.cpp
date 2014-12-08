@@ -51,7 +51,7 @@ void ggl_rasterPos2i(void* con, GGLint x, GGLint y)
 }
 
 void ggl_copyPixels(void* con, GGLint xs, GGLint ys,
-        GGLsizei width, GGLsizei height, GGLenum type)
+        GGLsizei width, GGLsizei height, GGLenum /*type*/)
 {
     GGL_CONTEXT(c, con);
 
@@ -143,7 +143,7 @@ void ggl_copyPixels(void* con, GGLint xs, GGLint ys,
 
 using namespace android;
 
-GGLint gglBitBlti(GGLContext* con, int tmu, GGLint crop[4], GGLint where[4])
+GGLint gglBitBlit(GGLContext* con, int tmu, GGLint crop[4], GGLint where[4])
 {
     GGL_CONTEXT(c, (void*)con);
 

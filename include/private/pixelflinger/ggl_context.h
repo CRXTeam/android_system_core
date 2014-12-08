@@ -21,8 +21,8 @@
 #include <stddef.h>
 #include <string.h>
 #include <sys/types.h>
+#include <endian.h>
 
-#include <utils/Endian.h>
 #include <pixelflinger/pixelflinger.h>
 #include <private/pixelflinger/ggl_fixed.h>
 
@@ -42,10 +42,30 @@ inline uint32_t GGL_HOST_TO_RGBA(uint32_t v) {
 #else
 
 inline uint32_t GGL_RGBA_TO_HOST(uint32_t v) {
+#if defined(__mips__) && __mips==32 && __mips_isa_rev>=2
+    uint32_t r;
+    __asm__("wsbh %0, %1;"
+        "rotr %0, %0, 16"
+        : "=r" (r)
+        : "r" (v)
+        );
+    return r;
+#else
     return (v<<24) | (v>>24) | ((v<<8)&0xff0000) | ((v>>8)&0xff00);
+#endif
 }
 inline uint32_t GGL_HOST_TO_RGBA(uint32_t v) {
+#if defined(__mips__) && __mips==32 && __mips_isa_rev>=2
+    uint32_t r;
+    __asm__("wsbh %0, %1;"
+        "rotr %0, %0, 16"
+        : "=r" (r)
+        : "r" (v)
+        );
+    return r;
+#else
     return (v<<24) | (v>>24) | ((v<<8)&0xff0000) | ((v>>8)&0xff00);
+#endif
 }
 
 #endif
@@ -101,7 +121,7 @@ template<bool> struct CTA;
 template<> struct CTA<true> { };
 
 #define GGL_CONTEXT(con, c)         context_t *con = static_cast<context_t *>(c)
-#define GGL_OFFSETOF(field)         int(&(((context_t*)0)->field))
+#define GGL_OFFSETOF(field)         uintptr_t(&(((context_t*)0)->field))
 #define GGL_INIT_PROC(p, f)         p.f = ggl_ ## f;
 #define GGL_BETWEEN(x, L, H)        (uint32_t((x)-(L)) <= ((H)-(L)))
 
@@ -147,11 +167,11 @@ GGL_RESERVE_NEEDS( P_FOG,           9, 1 )
 GGL_RESERVE_NEEDS( P_RESERVED1,    10,22 )
 
 GGL_RESERVE_NEEDS( T_FORMAT,        0, 6 )
-GGL_RESERVE_NEEDS( T_RESERVED0,     6, 2 )
+GGL_RESERVE_NEEDS( T_RESERVED0,     6, 1 )
+GGL_RESERVE_NEEDS( T_POT,           7, 1 )
 GGL_RESERVE_NEEDS( T_S_WRAP,        8, 2 )
 GGL_RESERVE_NEEDS( T_T_WRAP,       10, 2 )
-GGL_RESERVE_NEEDS( T_ENV,          12, 2 )
-GGL_RESERVE_NEEDS( T_POT,          14, 1 )
+GGL_RESERVE_NEEDS( T_ENV,          12, 3 )
 GGL_RESERVE_NEEDS( T_LINEAR,       15, 1 )
 
 const int GGL_NEEDS_WRAP_CLAMP_TO_EDGE  = 0;
@@ -182,12 +202,14 @@ inline uint32_t ggl_env_to_needs(uint32_t e) {
     case GGL_MODULATE:  return 1;
     case GGL_DECAL:     return 2;
     case GGL_BLEND:     return 3;
+    case GGL_ADD:       return 4;
     }
     return 0;
 }
 
 inline uint32_t ggl_needs_to_env(uint32_t n) {
-    const uint32_t envs[] = { GGL_REPLACE, GGL_MODULATE, GGL_DECAL, GGL_BLEND };
+    const uint32_t envs[] = { GGL_REPLACE, GGL_MODULATE, 
+            GGL_DECAL, GGL_BLEND, GGL_ADD };
     return envs[n];
 
 }
@@ -283,8 +305,7 @@ struct clear_state_t {
 };
 
 struct fog_state_t {
-    uint8_t     color[3];
-    uint8_t     reserved;
+    uint8_t     color[4];
 };
 
 struct logic_op_state_t {
@@ -319,16 +340,18 @@ struct pixel_t {
 
 struct surface_t {
     union {
-        GGLSurface      s;
+        GGLSurface          s;
+        // Keep the following struct field types in line with the corresponding
+        // GGLSurface fields to avoid mismatches leading to errors.
         struct {
-        uint32_t            reserved;
-        uint32_t			width;
-        uint32_t			height;
-        int32_t             stride;
-        uint8_t*			data;	
-        uint8_t				format;
-        uint8_t				dirty;
-        uint8_t				pad[2];
+            GGLsizei        reserved;
+            GGLuint         width;
+            GGLuint         height;
+            GGLint          stride;
+            GGLubyte*       data;
+            GGLubyte        format;
+            GGLubyte        dirty;
+            GGLubyte        pad[2];
         };
     };
     void                (*read) (const surface_t* s, context_t* c,
@@ -459,7 +482,7 @@ struct generated_tex_vars_t {
     uint32_t    width;
     uint32_t    height;
     uint32_t    stride;
-    int32_t     data;
+    uintptr_t   data;
     int32_t     dsdx;
     int32_t     dtdx;
     int32_t     spill[2];

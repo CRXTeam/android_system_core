@@ -9,7 +9,7 @@
  *    notice, this list of conditions and the following disclaimer.
  *  * Redistributions in binary form must reproduce the above copyright
  *    notice, this list of conditions and the following disclaimer in
- *    the documentation and/or other materials provided with the 
+ *    the documentation and/or other materials provided with the
  *    distribution.
  *
  * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
@@ -19,64 +19,116 @@
  * COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
  * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
  * BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
- * OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED 
+ * OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
  * AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
  * OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
  * SUCH DAMAGE.
  */
 
+#include "fastboot.h"
+#include "fs.h"
+
+#include <errno.h>
+#include <stdarg.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <stdarg.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
 
-#include "fastboot.h"
+#ifdef USE_MINGW
+#include <fcntl.h>
+#else
+#include <sys/mman.h>
+#endif
 
-char *mkmsg(const char *fmt, ...)
-{
-    char buf[256];
-    char *s;
-    va_list ap;
+#ifndef __unused
+#define __unused __attribute__((__unused__))
+#endif
 
-    va_start(ap, fmt);
-    vsprintf(buf, fmt, ap);
-    va_end(ap);
-    
-    s = strdup(buf);
-    if (s == 0) die("out of memory");
-    return s;
-}
+#define ARRAY_SIZE(x)           (sizeof(x)/sizeof(x[0]))
 
 #define OP_DOWNLOAD   1
 #define OP_COMMAND    2
 #define OP_QUERY      3
 #define OP_NOTICE     4
+#define OP_DOWNLOAD_SPARSE 5
+#define OP_WAIT_FOR_DISCONNECT 6
 
 typedef struct Action Action;
 
-struct Action 
+#define CMD_SIZE 64
+
+struct Action
 {
     unsigned op;
     Action *next;
 
-    char cmd[64];    
+    char cmd[CMD_SIZE];
+    const char *prod;
     void *data;
     unsigned size;
 
     const char *msg;
     int (*func)(Action *a, int status, char *resp);
+
+    double start;
 };
 
 static Action *action_list = 0;
 static Action *action_last = 0;
+
+
+
+
+int fb_getvar(struct usb_handle *usb, char *response, const char *fmt, ...)
+{
+    char cmd[CMD_SIZE] = "getvar:";
+    int getvar_len = strlen(cmd);
+    va_list args;
+
+    response[FB_RESPONSE_SZ] = '\0';
+    va_start(args, fmt);
+    vsnprintf(cmd + getvar_len, sizeof(cmd) - getvar_len, fmt, args);
+    va_end(args);
+    cmd[CMD_SIZE - 1] = '\0';
+    return fb_command_response(usb, cmd, response);
+}
+
+
+/* Return true if this partition is supported by the fastboot format command.
+ * It is also used to determine if we should first erase a partition before
+ * flashing it with an ext4 filesystem.  See needs_erase()
+ *
+ * Not all devices report the filesystem type, so don't report any errors,
+ * just return false.
+ */
+int fb_format_supported(usb_handle *usb, const char *partition, const char *type_override)
+{
+    char fs_type[FB_RESPONSE_SZ + 1] = {0,};
+    int status;
+
+    if (type_override) {
+        return !!fs_get_generator(type_override);
+    }
+    status = fb_getvar(usb, fs_type, "partition-type:%s", partition);
+    if (status) {
+        return 0;
+    }
+    return !!fs_get_generator(fs_type);
+}
 
 static int cb_default(Action *a, int status, char *resp)
 {
     if (status) {
         fprintf(stderr,"FAILED (%s)\n", resp);
     } else {
-        fprintf(stderr,"OKAY\n");
+        double split = now();
+        fprintf(stderr,"OKAY [%7.3fs]\n", (split - a->start));
+        a->start = split;
     }
     return status;
 }
@@ -85,13 +137,19 @@ static Action *queue_action(unsigned op, const char *fmt, ...)
 {
     Action *a;
     va_list ap;
+    size_t cmdsize;
 
     a = calloc(1, sizeof(Action));
     if (a == 0) die("out of memory");
 
     va_start(ap, fmt);
-    vsprintf(a->cmd, fmt, ap);
+    cmdsize = vsnprintf(a->cmd, sizeof(a->cmd), fmt, ap);
     va_end(ap);
+
+    if (cmdsize >= sizeof(a->cmd)) {
+        free(a);
+        die("Command length (%d) exceeds maximum size (%d)", cmdsize, sizeof(a->cmd));
+    }
 
     if (action_last) {
         action_last->next = a;
@@ -101,6 +159,9 @@ static Action *queue_action(unsigned op, const char *fmt, ...)
     action_last = a;
     a->op = op;
     a->func = cb_default;
+
+    a->start = -1;
+
     return a;
 }
 
@@ -124,11 +185,22 @@ void fb_queue_flash(const char *ptn, void *data, unsigned sz)
     a->msg = mkmsg("writing '%s'", ptn);
 }
 
+void fb_queue_flash_sparse(const char *ptn, struct sparse_file *s, unsigned sz)
+{
+    Action *a;
+
+    a = queue_action(OP_DOWNLOAD_SPARSE, "");
+    a->data = s;
+    a->size = 0;
+    a->msg = mkmsg("sending sparse '%s' (%d KB)", ptn, sz / 1024);
+
+    a = queue_action(OP_COMMAND, "flash:%s", ptn);
+    a->msg = mkmsg("writing '%s'", ptn);
+}
+
 static int match(char *str, const char **value, unsigned count)
 {
-    const char *val;
     unsigned n;
-    int len;
 
     for (n = 0; n < count; n++) {
         const char *val = value[n];
@@ -162,11 +234,23 @@ static int cb_check(Action *a, int status, char *resp, int invert)
         return status;
     }
 
+    if (a->prod) {
+        if (strcmp(a->prod, cur_product) != 0) {
+            double split = now();
+            fprintf(stderr,"IGNORE, product is %s required only for %s [%7.3fs]\n",
+                    cur_product, a->prod, (split - a->start));
+            a->start = split;
+            return 0;
+        }
+    }
+
     yes = match(resp, value, count);
     if (invert) yes = !yes;
 
     if (yes) {
-        fprintf(stderr,"OKAY\n");
+        double split = now();
+        fprintf(stderr,"OKAY [%7.3fs]\n", (split - a->start));
+        a->start = split;
         return 0;
     }
 
@@ -191,10 +275,12 @@ static int cb_reject(Action *a, int status, char *resp)
     return cb_check(a, status, resp, 1);
 }
 
-void fb_queue_require(const char *var, int invert, unsigned nvalues, const char **value)
+void fb_queue_require(const char *prod, const char *var,
+		int invert, unsigned nvalues, const char **value)
 {
     Action *a;
     a = queue_action(OP_QUERY, "getvar:%s", var);
+    a->prod = prod;
     a->data = value;
     a->size = nvalues;
     a->msg = mkmsg("checking %s", var);
@@ -221,7 +307,26 @@ void fb_queue_display(const char *var, const char *prettyname)
     a->func = cb_display;
 }
 
-static int cb_do_nothing(Action *a, int status, char *resp)
+static int cb_save(Action *a, int status, char *resp)
+{
+    if (status) {
+        fprintf(stderr, "%s FAILED (%s)\n", a->cmd, resp);
+        return status;
+    }
+    strncpy(a->data, resp, a->size);
+    return 0;
+}
+
+void fb_queue_query_save(const char *var, char *dest, unsigned dest_size)
+{
+    Action *a;
+    a = queue_action(OP_QUERY, "getvar:%s", var);
+    a->data = (void *)dest;
+    a->size = dest_size;
+    a->func = cb_save;
+}
+
+static int cb_do_nothing(Action *a __unused, int status __unused, char *resp __unused)
 {
     fprintf(stderr,"\n");
     return 0;
@@ -254,18 +359,29 @@ void fb_queue_notice(const char *notice)
     a->data = (void*) notice;
 }
 
-void fb_execute_queue(usb_handle *usb)
+void fb_queue_wait_for_disconnect(void)
+{
+    queue_action(OP_WAIT_FOR_DISCONNECT, "");
+}
+
+int fb_execute_queue(usb_handle *usb)
 {
     Action *a;
     char resp[FB_RESPONSE_SZ+1];
-    int status;
+    int status = 0;
 
     a = action_list;
+    if (!a)
+        return status;
     resp[FB_RESPONSE_SZ] = 0;
 
+    double start = -1;
     for (a = action_list; a; a = a->next) {
+        a->start = now();
+        if (start < 0) start = a->start;
         if (a->msg) {
-            fprintf(stderr,"%s... ",a->msg);
+            // fprintf(stderr,"%30s... ",a->msg);
+            fprintf(stderr,"%s...\n",a->msg);
         }
         if (a->op == OP_DOWNLOAD) {
             status = fb_download_data(usb, a->data, a->size);
@@ -281,9 +397,22 @@ void fb_execute_queue(usb_handle *usb)
             if (status) break;
         } else if (a->op == OP_NOTICE) {
             fprintf(stderr,"%s\n",(char*)a->data);
+        } else if (a->op == OP_DOWNLOAD_SPARSE) {
+            status = fb_download_data_sparse(usb, a->data);
+            status = a->func(a, status, status ? fb_get_error() : "");
+            if (status) break;
+        } else if (a->op == OP_WAIT_FOR_DISCONNECT) {
+            usb_wait_for_disconnect(usb);
         } else {
             die("bogus action");
         }
     }
+
+    fprintf(stderr,"finished. total time: %.3fs\n", (now() - start));
+    return status;
 }
 
+int fb_queue_is_empty(void)
+{
+    return (action_list == NULL);
+}

@@ -1,6 +1,6 @@
 /* sha.c
 **
-** Copyright 2008, The Android Open Source Project
+** Copyright 2013, The Android Open Source Project
 **
 ** Redistribution and use in source and binary forms, with or without
 ** modification, are permitted provided that the following conditions are met:
@@ -13,26 +13,32 @@
 **       be used to endorse or promote products derived from this software
 **       without specific prior written permission.
 **
-** THIS SOFTWARE IS PROVIDED BY Google Inc. ``AS IS'' AND ANY EXPRESS OR 
+** THIS SOFTWARE IS PROVIDED BY Google Inc. ``AS IS'' AND ANY EXPRESS OR
 ** IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
-** MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO 
+** MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO
 ** EVENT SHALL Google Inc. BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
 ** SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
-** PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; 
-** OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, 
-** WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR 
+** PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
+** OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY,
+** WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
 ** OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
 ** ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
+// Optimized for minimal code size.
+
 #include "mincrypt/sha.h"
+
+#include <stdio.h>
+#include <string.h>
+#include <stdint.h>
 
 #define rol(bits, value) (((value) << (bits)) | ((value) >> (32 - (bits))))
 
-static void SHA1_transform(SHA_CTX *ctx) {
+static void SHA1_Transform(SHA_CTX* ctx) {
     uint32_t W[80];
     uint32_t A, B, C, D, E;
-    uint8_t *p = ctx->buf;
+    uint8_t* p = ctx->buf;
     int t;
 
     for(t = 0; t < 16; ++t) {
@@ -79,7 +85,16 @@ static void SHA1_transform(SHA_CTX *ctx) {
     ctx->state[4] += E;
 }
 
-void SHA_init(SHA_CTX *ctx) {
+static const HASH_VTAB SHA_VTAB = {
+    SHA_init,
+    SHA_update,
+    SHA_final,
+    SHA_hash,
+    SHA_DIGEST_SIZE
+};
+
+void SHA_init(SHA_CTX* ctx) {
+    ctx->f = &SHA_VTAB;
     ctx->state[0] = 0x67452301;
     ctx->state[1] = 0xEFCDAB89;
     ctx->state[2] = 0x98BADCFE;
@@ -88,31 +103,34 @@ void SHA_init(SHA_CTX *ctx) {
     ctx->count = 0;
 }
 
-void SHA_update(SHA_CTX *ctx, const void *data, int len) {
-    int i = ctx->count % sizeof(ctx->buf);
+
+void SHA_update(SHA_CTX* ctx, const void* data, int len) {
+    int i = (int) (ctx->count & 63);
     const uint8_t* p = (const uint8_t*)data;
 
     ctx->count += len;
 
     while (len--) {
         ctx->buf[i++] = *p++;
-        if (i == sizeof(ctx->buf)) {
-            SHA1_transform(ctx);
+        if (i == 64) {
+            SHA1_Transform(ctx);
             i = 0;
         }
     }
 }
-const uint8_t *SHA_final(SHA_CTX *ctx) {
+
+
+const uint8_t* SHA_final(SHA_CTX* ctx) {
     uint8_t *p = ctx->buf;
     uint64_t cnt = ctx->count * 8;
     int i;
 
     SHA_update(ctx, (uint8_t*)"\x80", 1);
-    while ((ctx->count % sizeof(ctx->buf)) != (sizeof(ctx->buf) - 8)) {
+    while ((ctx->count & 63) != 56) {
         SHA_update(ctx, (uint8_t*)"\0", 1);
     }
     for (i = 0; i < 8; ++i) {
-        uint8_t tmp = cnt >> ((7 - i) * 8);
+        uint8_t tmp = (uint8_t) (cnt >> ((7 - i) * 8));
         SHA_update(ctx, &tmp, 1);
     }
 
@@ -128,15 +146,10 @@ const uint8_t *SHA_final(SHA_CTX *ctx) {
 }
 
 /* Convenience function */
-const uint8_t* SHA(const void *data, int len, uint8_t *digest) {
-    const uint8_t *p;
-    int i;
+const uint8_t* SHA_hash(const void* data, int len, uint8_t* digest) {
     SHA_CTX ctx;
     SHA_init(&ctx);
     SHA_update(&ctx, data, len);
-    p = SHA_final(&ctx);
-    for (i = 0; i < SHA_DIGEST_SIZE; ++i) {
-        digest[i] = *p++;
-    }
+    memcpy(digest, SHA_final(&ctx), SHA_DIGEST_SIZE);
     return digest;
 }

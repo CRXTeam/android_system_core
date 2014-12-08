@@ -1,23 +1,39 @@
 #include <stdio.h>
+#include <stdlib.h>
 
 #include <cutils/properties.h>
 
-#include <sys/system_properties.h>
+#include "dynarray.h"
 
-static void proplist(const char *key, const char *name, 
-                     void *user __attribute__((unused)))
+static void record_prop(const char* key, const char* name, void* opaque)
 {
-    printf("[%s]: [%s]\n", key, name);
+    strlist_t* list = opaque;
+    char temp[PROP_VALUE_MAX + PROP_NAME_MAX + 16];
+    snprintf(temp, sizeof temp, "[%s]: [%s]", key, name);
+    strlist_append_dup(list, temp);
 }
 
-int __system_property_wait(prop_info *pi);
+static void list_properties(void)
+{
+    strlist_t  list[1] = { STRLIST_INITIALIZER };
+
+    /* Record properties in the string list */
+    (void)property_list(record_prop, list);
+
+    /* Sort everything */
+    strlist_sort(list);
+
+    /* print everything */
+    STRLIST_FOREACH(list, str, printf("%s\n", str));
+
+    /* voila */
+    strlist_done(list);
+}
 
 int getprop_main(int argc, char *argv[])
 {
-    int n = 0;
-
     if (argc == 1) {
-        (void)property_list(proplist, NULL);
+        list_properties();
     } else {
         char value[PROPERTY_VALUE_MAX];
         char *default_value;

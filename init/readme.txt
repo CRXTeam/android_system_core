@@ -70,10 +70,13 @@ disabled
 setenv <name> <value>
    Set the environment variable <name> to <value> in the launched process.
 
-socket <name> <type> <perm> [ <user> [ <group> ] ]
+socket <name> <type> <perm> [ <user> [ <group> [ <context> ] ] ]
    Create a unix domain socket named /dev/socket/<name> and pass
-   its fd to the launched process.  <type> must be "dgram" or "stream".
+   its fd to the launched process.  <type> must be "dgram", "stream" or "seqpacket".
    User and group default to 0.
+   Context is the SELinux security context for the socket.
+   It defaults to the service security context, as specified by seclabel or
+   computed based on the service executable file security context.
 
 user <username>
    Change to username before exec'ing this service.
@@ -87,6 +90,13 @@ group <groupname> [ <groupname> ]*
    groupnames beyond the (required) first one are used to set the
    supplemental groups of the process (via setgroups()).
    Currently defaults to root.  (??? probably should default to nobody)
+
+seclabel <securitycontext>
+  Change to securitycontext before exec'ing this service.
+  Primarily for use by services run from the rootfs, e.g. ueventd, adbd.
+  Services on the system partition can instead use policy-defined transitions
+  based on their file security context.
+  If not specified and no transition is defined in policy, defaults to the init context.
 
 oneshot
    Do not restart the service when it exits.
@@ -145,11 +155,17 @@ import <filename>
 hostname <name>
    Set the host name.
 
+chdir <directory>
+   Change working directory.
+
 chmod <octal-mode> <path>
    Change file access permissions.
 
 chown <owner> <group> <path>
    Change file owner and group.
+
+chroot <directory>
+  Change process root directory.
 
 class_start <serviceclass>
    Start all services of the specified class if they are
@@ -161,6 +177,16 @@ class_stop <serviceclass>
 
 domainname <name>
    Set the domain name.
+
+enable <servicename>
+   Turns a disabled service into an enabled one as if the service did not
+   specify disabled.
+   If the service is supposed to be running, it will be started now.
+   Typically used when the bootloader sets a variable that indicates a specific
+   service should be started when needed. E.g.
+     on property:ro.boot.myfancyhardware=1
+        enable my_fancy_service_for_my_fancy_hardware
+
 
 insmod <path>
    Install the module at <path>
@@ -176,6 +202,27 @@ mount <type> <device> <dir> [ <mountoption> ]*
    device by name.
    <mountoption>s include "ro", "rw", "remount", "noatime", ...
 
+restorecon <path> [ <path> ]*
+   Restore the file named by <path> to the security context specified
+   in the file_contexts configuration.
+   Not required for directories created by the init.rc as these are
+   automatically labeled correctly by init.
+
+restorecon_recursive <path> [ <path> ]*
+   Recursively restore the directory tree named by <path> to the
+   security contexts specified in the file_contexts configuration.
+   Do NOT use this with paths leading to shell-writable or app-writable
+   directories, e.g. /data/local/tmp, /data/data or any prefix thereof.
+
+setcon <securitycontext>
+   Set the current process security context to the specified string.
+   This is typically only used from early-init to set the init context
+   before any other process is started.
+
+setenforce 0|1
+   Set the SELinux system-wide enforcing status.
+   0 is permissive (i.e. log but do not deny), 1 is enforcing.
+
 setkey
    TBD
 
@@ -184,6 +231,10 @@ setprop <name> <value>
 
 setrlimit <resource> <cur> <max>
    Set the rlimit for a resource.
+
+setsebool <name> <value>
+   Set SELinux boolean <name> to <value>.
+   <value> may be 1|true|on or 0|false|off
 
 start <service>
    Start a service running if it is not already running.
@@ -194,13 +245,21 @@ stop <service>
 symlink <target> <path>
    Create a symbolic link at <path> with the value <target>
 
+sysclktz <mins_west_of_gmt>
+   Set the system clock base (0 if system clock ticks in GMT)
+
 trigger <event>
    Trigger an event.  Used to queue an action from another
    action.
 
-write <path> <string> [ <string> ]*
-   Open the file at <path> and write one or more strings
-   to it with write(2)
+wait <path> [ <timeout> ]
+  Poll for the existence of the given file and return when found,
+  or the timeout has been reached. If timeout is not specified it
+  currently defaults to five seconds.
+
+write <path> <string>
+   Open the file at <path> and write a string to it with write(2)
+   without appending.
 
 
 Properties

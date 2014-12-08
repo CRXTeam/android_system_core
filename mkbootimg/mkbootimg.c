@@ -2,16 +2,16 @@
 **
 ** Copyright 2007, The Android Open Source Project
 **
-** Licensed under the Apache License, Version 2.0 (the "License"); 
-** you may not use this file except in compliance with the License. 
-** You may obtain a copy of the License at 
+** Licensed under the Apache License, Version 2.0 (the "License");
+** you may not use this file except in compliance with the License.
+** You may obtain a copy of the License at
 **
-**     http://www.apache.org/licenses/LICENSE-2.0 
+**     http://www.apache.org/licenses/LICENSE-2.0
 **
-** Unless required by applicable law or agreed to in writing, software 
-** distributed under the License is distributed on an "AS IS" BASIS, 
-** WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. 
-** See the License for the specific language governing permissions and 
+** Unless required by applicable law or agreed to in writing, software
+** distributed under the License is distributed on an "AS IS" BASIS,
+** WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+** See the License for the specific language governing permissions and
 ** limitations under the License.
 */
 
@@ -21,8 +21,8 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
-#include <time.h>
 
+#include "mincrypt/sha.h"
 #include "bootimg.h"
 
 static void *load_file(const char *fn, unsigned *_sz)
@@ -63,6 +63,9 @@ int usage(void)
             "       [ --second <2ndbootloader-filename> ]\n"
             "       [ --cmdline <kernel-commandline> ]\n"
             "       [ --board <boardname> ]\n"
+            "       [ --base <address> ]\n"
+            "       [ --pagesize <pagesize> ]\n"
+            "       [ --dt <filename> ]\n"
             "       -o|--output <filename>\n"
             );
     return 1;
@@ -70,19 +73,19 @@ int usage(void)
 
 
 
-static unsigned char padding[2048] = { 0, };
+static unsigned char padding[131072] = { 0, };
 
 int write_padding(int fd, unsigned pagesize, unsigned itemsize)
 {
     unsigned pagemask = pagesize - 1;
-    unsigned count;
+    ssize_t count;
 
     if((itemsize & pagemask) == 0) {
         return 0;
     }
 
     count = pagesize - (itemsize & pagemask);
-    
+
     if(write(fd, padding, count) != count) {
         return -1;
     } else {
@@ -90,21 +93,10 @@ int write_padding(int fd, unsigned pagesize, unsigned itemsize)
     }
 }
 
-unsigned checksum(void *_ptr, unsigned len)
-{
-    unsigned chk = 0;
-    unsigned char *ptr = _ptr;
-    while (len > 0) {
-        chk += *ptr++;
-        len--;
-    }
-    return chk;
-}
-
 int main(int argc, char **argv)
 {
     boot_img_hdr hdr;
-    
+
     char *kernel_fn = 0;
     void *kernel_data = 0;
     char *ramdisk_fn = 0;
@@ -114,15 +106,24 @@ int main(int argc, char **argv)
     char *cmdline = "";
     char *bootimg = 0;
     char *board = "";
+    char *dt_fn = 0;
+    void *dt_data = 0;
     unsigned pagesize = 2048;
-    unsigned saddr = 0;
     int fd;
-    
+    SHA_CTX ctx;
+    const uint8_t* sha;
+    unsigned base           = 0x10000000;
+    unsigned kernel_offset  = 0x00008000;
+    unsigned ramdisk_offset = 0x01000000;
+    unsigned second_offset  = 0x00f00000;
+    unsigned tags_offset    = 0x00000100;
+    size_t cmdlen;
+
     argc--;
     argv++;
 
     memset(&hdr, 0, sizeof(hdr));
-    
+
     while(argc > 0){
         char *arg = argv[0];
         char *val = argv[1];
@@ -141,14 +142,39 @@ int main(int argc, char **argv)
             second_fn = val;
         } else if(!strcmp(arg, "--cmdline")) {
             cmdline = val;
-        } else if(!strcmp(arg, "--saddr")) {
-            saddr = strtoul(val, 0, 16);
+        } else if(!strcmp(arg, "--base")) {
+            base = strtoul(val, 0, 16);
+        } else if(!strcmp(arg, "--kernel_offset")) {
+            kernel_offset = strtoul(val, 0, 16);
+        } else if(!strcmp(arg, "--ramdisk_offset")) {
+            ramdisk_offset = strtoul(val, 0, 16);
+        } else if(!strcmp(arg, "--second_offset")) {
+            second_offset = strtoul(val, 0, 16);
+        } else if(!strcmp(arg, "--tags_offset")) {
+            tags_offset = strtoul(val, 0, 16);
         } else if(!strcmp(arg, "--board")) {
             board = val;
+        } else if(!strcmp(arg,"--pagesize")) {
+            pagesize = strtoul(val, 0, 10);
+            if ((pagesize != 2048) && (pagesize != 4096)
+                && (pagesize != 8192) && (pagesize != 16384)
+                && (pagesize != 32768) && (pagesize != 65536)
+                && (pagesize != 131072)) {
+                fprintf(stderr,"error: unsupported page size %d\n", pagesize);
+                return -1;
+            }
+        } else if(!strcmp(arg, "--dt")) {
+            dt_fn = val;
         } else {
             return usage();
         }
     }
+    hdr.page_size = pagesize;
+
+    hdr.kernel_addr =  base + kernel_offset;
+    hdr.ramdisk_addr = base + ramdisk_offset;
+    hdr.second_addr =  base + second_offset;
+    hdr.tags_addr =    base + tags_offset;
 
     if(bootimg == 0) {
         fprintf(stderr,"error: no output filename specified\n");
@@ -170,32 +196,30 @@ int main(int argc, char **argv)
         return usage();
     }
 
-    strcpy(hdr.name, board);
-    
-    hdr.kernel_addr =  0x10008000;
-    hdr.ramdisk_addr = 0x11000000;
-    if(saddr) {
-        hdr.second_addr =  0x00300000;
-    } else {
-        hdr.second_addr =  0x10F00000;
-    }
-    hdr.tags_addr   =  0x10000100;
-    hdr.page_size = pagesize;
-    
+    strcpy((char *) hdr.name, board);
+
     memcpy(hdr.magic, BOOT_MAGIC, BOOT_MAGIC_SIZE);
-    
-    if(strlen(cmdline) > (BOOT_ARGS_SIZE - 1)) {
+
+    cmdlen = strlen(cmdline);
+    if(cmdlen > (BOOT_ARGS_SIZE + BOOT_EXTRA_ARGS_SIZE - 2)) {
         fprintf(stderr,"error: kernel commandline too large\n");
         return 1;
     }
-    strcpy((char*)hdr.cmdline, cmdline);
-    
+    /* Even if we need to use the supplemental field, ensure we
+     * are still NULL-terminated */
+    strncpy((char *)hdr.cmdline, cmdline, BOOT_ARGS_SIZE - 1);
+    hdr.cmdline[BOOT_ARGS_SIZE - 1] = '\0';
+    if (cmdlen >= (BOOT_ARGS_SIZE - 1)) {
+        cmdline += (BOOT_ARGS_SIZE - 1);
+        strncpy((char *)hdr.extra_cmdline, cmdline, BOOT_EXTRA_ARGS_SIZE);
+    }
+
     kernel_data = load_file(kernel_fn, &hdr.kernel_size);
     if(kernel_data == 0) {
         fprintf(stderr,"error: could not load kernel '%s'\n", kernel_fn);
         return 1;
     }
-    
+
     if(!strcmp(ramdisk_fn,"NONE")) {
         ramdisk_data = 0;
         hdr.ramdisk_size = 0;
@@ -215,15 +239,31 @@ int main(int argc, char **argv)
         }
     }
 
-        /* put some stuff in the header to differentiate between
-         * different boot images.  SHA1 would be nicer, but this
-         * isn't for crypto grade anything, just to have a quick
-         * way to compare boot.imgs based on their first 2k
-         */
-    hdr.id[0] = (unsigned) time(0);
-    hdr.id[1] = checksum(kernel_data, hdr.kernel_size);
-    hdr.id[2] = checksum(ramdisk_data, hdr.ramdisk_size);
-    hdr.id[3] = checksum(second_data, hdr.second_size);
+    if(dt_fn) {
+        dt_data = load_file(dt_fn, &hdr.dt_size);
+        if (dt_data == 0) {
+            fprintf(stderr,"error: could not load device tree image '%s'\n", dt_fn);
+            return 1;
+        }
+    }
+
+    /* put a hash of the contents in the header so boot images can be
+     * differentiated based on their first 2k.
+     */
+    SHA_init(&ctx);
+    SHA_update(&ctx, kernel_data, hdr.kernel_size);
+    SHA_update(&ctx, &hdr.kernel_size, sizeof(hdr.kernel_size));
+    SHA_update(&ctx, ramdisk_data, hdr.ramdisk_size);
+    SHA_update(&ctx, &hdr.ramdisk_size, sizeof(hdr.ramdisk_size));
+    SHA_update(&ctx, second_data, hdr.second_size);
+    SHA_update(&ctx, &hdr.second_size, sizeof(hdr.second_size));
+    if(dt_data) {
+        SHA_update(&ctx, dt_data, hdr.dt_size);
+        SHA_update(&ctx, &hdr.dt_size, sizeof(hdr.dt_size));
+    }
+    sha = SHA_final(&ctx);
+    memcpy(hdr.id, sha,
+           SHA_DIGEST_SIZE > sizeof(hdr.id) ? sizeof(hdr.id) : SHA_DIGEST_SIZE);
 
     fd = open(bootimg, O_CREAT | O_TRUNC | O_WRONLY, 0644);
     if(fd < 0) {
@@ -234,19 +274,23 @@ int main(int argc, char **argv)
     if(write(fd, &hdr, sizeof(hdr)) != sizeof(hdr)) goto fail;
     if(write_padding(fd, pagesize, sizeof(hdr))) goto fail;
 
-    if(write(fd, kernel_data, hdr.kernel_size) != hdr.kernel_size) goto fail;
+    if(write(fd, kernel_data, hdr.kernel_size) != (ssize_t) hdr.kernel_size) goto fail;
     if(write_padding(fd, pagesize, hdr.kernel_size)) goto fail;
 
-    if(write(fd, ramdisk_data, hdr.ramdisk_size) != hdr.ramdisk_size) goto fail;
+    if(write(fd, ramdisk_data, hdr.ramdisk_size) != (ssize_t) hdr.ramdisk_size) goto fail;
     if(write_padding(fd, pagesize, hdr.ramdisk_size)) goto fail;
 
     if(second_data) {
-        if(write(fd, second_data, hdr.second_size) != hdr.second_size) goto fail;
-        if(write_padding(fd, pagesize, hdr.ramdisk_size)) goto fail;
+        if(write(fd, second_data, hdr.second_size) != (ssize_t) hdr.second_size) goto fail;
+        if(write_padding(fd, pagesize, hdr.second_size)) goto fail;
     }
 
+    if(dt_data) {
+        if(write(fd, dt_data, hdr.dt_size) != (ssize_t) hdr.dt_size) goto fail;
+        if(write_padding(fd, pagesize, hdr.dt_size)) goto fail;
+    }
     return 0;
-    
+
 fail:
     unlink(bootimg);
     close(fd);
@@ -254,4 +298,3 @@ fail:
             strerror(errno));
     return 1;
 }
-

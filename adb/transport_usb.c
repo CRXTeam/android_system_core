@@ -23,8 +23,7 @@
 #define  TRACE_TAG  TRACE_TRANSPORT
 #include "adb.h"
 
-/* XXX better define? */
-#ifdef __ppc__
+#ifdef HAVE_BIG_ENDIAN
 #define H4(x)	(((x) & 0xFF000000) >> 24) | (((x) & 0x00FF0000) >> 8) | (((x) & 0x0000FF00) << 8) | (((x) & 0x000000FF) << 24)
 static inline void fix_endians(apacket *p)
 {
@@ -55,7 +54,7 @@ static int remote_read(apacket *p, atransport *t)
     }
 
     fix_endians(p);
-    
+
     if(check_header(p)) {
         D("remote usb: check_header failed\n");
         return -1;
@@ -79,9 +78,9 @@ static int remote_read(apacket *p, atransport *t)
 static int remote_write(apacket *p, atransport *t)
 {
     unsigned size = p->msg.data_length;
-    
+
     fix_endians(p);
-    
+
     if(usb_write(t->usb, &p->msg, sizeof(amessage))) {
         D("remote usb: 1 - write terminated\n");
         return -1;
@@ -91,7 +90,7 @@ static int remote_write(apacket *p, atransport *t)
         D("remote usb: 2 - write terminated\n");
         return -1;
     }
-        
+
     return 0;
 }
 
@@ -106,7 +105,7 @@ static void remote_kick(atransport *t)
     usb_kick(t->usb);
 }
 
-void init_usb_transport(atransport *t, usb_handle *h)
+void init_usb_transport(atransport *t, usb_handle *h, int state)
 {
     D("transport: usb\n");
     t->close = remote_close;
@@ -114,10 +113,10 @@ void init_usb_transport(atransport *t, usb_handle *h)
     t->read_from_remote = remote_read;
     t->write_to_remote = remote_write;
     t->sync_token = 1;
-    t->connection_state = CS_OFFLINE;
+    t->connection_state = state;
     t->type = kTransportUsb;
     t->usb = h;
-    
+
 #if ADB_HOST
     HOST = 1;
 #else
@@ -125,23 +124,9 @@ void init_usb_transport(atransport *t, usb_handle *h)
 #endif
 }
 
+#if ADB_HOST
 int is_adb_interface(int vid, int pid, int usb_class, int usb_subclass, int usb_protocol)
 {
-    if (vid == VENDOR_ID_GOOGLE) {
-            /* might support adb */
-    } else if (vid == VENDOR_ID_HTC) {
-            /* might support adb */
-    } else {
-            /* not supported */
-        return 0;
-    }
-    
-        /* class:vendor (0xff) subclass:android (0x42) proto:adb (0x01) */
-    if(usb_class == 0xff) {
-        if((usb_subclass == 0x42) && (usb_protocol == 0x01)) {
-            return 1;
-        }
-    }
-
-    return 0;
+    return (usb_class == ADB_CLASS && usb_subclass == ADB_SUBCLASS && usb_protocol == ADB_PROTOCOL);
 }
+#endif

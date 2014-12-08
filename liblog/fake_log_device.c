@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2008 The Android Open Source Project
+ * Copyright (C) 2008-2014 The Android Open Source Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,16 +19,22 @@
  * passed on to the underlying (fake) log device.  When not in the
  * simulator, messages are printed to stderr.
  */
-#include "cutils/logd.h"
+#include "fake_log_device.h"
 
-#include <stdlib.h>
-#include <string.h>
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include <log/logd.h>
 
 #ifdef HAVE_PTHREADS
 #include <pthread.h>
+#endif
+
+#ifndef __unused
+#define __unused __attribute__((__unused__))
 #endif
 
 #define kMaxTagLen  16      /* from the long-dead utils/Log.cpp */
@@ -320,11 +326,11 @@ static const char* getPriorityString(int priority)
  * Make up something to replace it.
  */
 static ssize_t fake_writev(int fd, const struct iovec *iov, int iovcnt) {
-    int result = 0;
-    struct iovec* end = iov + iovcnt;
+    ssize_t result = 0;
+    const struct iovec* end = iov + iovcnt;
     for (; iov < end; iov++) {
-        int w = write(fd, iov->iov_base, iov->iov_len);
-        if (w != iov->iov_len) {
+        ssize_t w = write(fd, iov->iov_base, iov->iov_len);
+        if (w != (ssize_t) iov->iov_len) {
             if (w < 0)
                 return w;
             return result + w;
@@ -398,7 +404,7 @@ static void showLog(LogState *state,
         break;
     case FORMAT_THREAD:
         prefixLen = snprintf(prefixBuf, sizeof(prefixBuf),
-            "%c(%5d:%p) ", priChar, pid, (void*)tid);
+            "%c(%5d:%5d) ", priChar, pid, tid);
         strcpy(suffixBuf, "\n"); suffixLen = 1;
         break;
     case FORMAT_RAW:
@@ -417,8 +423,8 @@ static void showLog(LogState *state,
         break;
     case FORMAT_LONG:
         prefixLen = snprintf(prefixBuf, sizeof(prefixBuf),
-            "[ %s %5d:%p %c/%-8s ]\n",
-            timeBuf, pid, (void*)tid, priChar, tag);
+            "[ %s %5d:%5d %c/%-8s ]\n",
+            timeBuf, pid, tid, priChar, tag);
         strcpy(suffixBuf, "\n\n"); suffixLen = 2;
         break;
     default:
@@ -438,31 +444,38 @@ static void showLog(LogState *state,
         if (*p++ == '\n') numLines++;
     }
     if (p > msg && *(p-1) != '\n') numLines++;
-    
+
     /*
      * Create an array of iovecs large enough to write all of
      * the lines with a prefix and a suffix.
      */
     const size_t INLINE_VECS = 6;
+    const size_t MAX_LINES   = ((size_t)~0)/(3*sizeof(struct iovec*));
     struct iovec stackVec[INLINE_VECS];
     struct iovec* vec = stackVec;
-    
-    numLines *= 3;  // 3 iovecs per line.
-    if (numLines > INLINE_VECS) {
-        vec = (struct iovec*)malloc(sizeof(struct iovec)*numLines);
+    size_t numVecs;
+
+    if (numLines > MAX_LINES)
+        numLines = MAX_LINES;
+
+    numVecs = numLines*3;  // 3 iovecs per line.
+    if (numVecs > INLINE_VECS) {
+        vec = (struct iovec*)malloc(sizeof(struct iovec)*numVecs);
         if (vec == NULL) {
             msg = "LOG: write failed, no memory";
-            numLines = 3;
+            numVecs = 3;
+            numLines = 1;
+            vec = stackVec;
         }
     }
-    
+
     /*
      * Fill in the iovec pointers.
      */
     p = msg;
     struct iovec* v = vec;
     int totalLen = 0;
-    while (p < end) {
+    while (numLines > 0 && p < end) {
         if (prefixLen > 0) {
             v->iov_base = prefixBuf;
             v->iov_len = prefixLen;
@@ -484,6 +497,7 @@ static void showLog(LogState *state,
             totalLen += suffixLen;
             v++;
         }
+        numLines -= 1;
     }
     
     /*
@@ -603,7 +617,7 @@ static int logClose(int fd)
 /*
  * Open a log output device and return a fake fd.
  */
-static int logOpen(const char* pathName, int flags)
+static int logOpen(const char* pathName, int flags __unused)
 {
     LogState *logState;
     int fd = -1;

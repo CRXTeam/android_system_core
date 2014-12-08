@@ -2,55 +2,78 @@
 **
 ** Copyright 2008, The Android Open Source Project
 **
-** Licensed under the Apache License, Version 2.0 (the "License"); 
-** you may not use this file except in compliance with the License. 
-** You may obtain a copy of the License at 
+** Licensed under the Apache License, Version 2.0 (the "License");
+** you may not use this file except in compliance with the License.
+** You may obtain a copy of the License at
 **
-**     http://www.apache.org/licenses/LICENSE-2.0 
+**     http://www.apache.org/licenses/LICENSE-2.0
 **
-** Unless required by applicable law or agreed to in writing, software 
-** distributed under the License is distributed on an "AS IS" BASIS, 
-** WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. 
-** See the License for the specific language governing permissions and 
+** Unless required by applicable law or agreed to in writing, software
+** distributed under the License is distributed on an "AS IS" BASIS,
+** WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+** See the License for the specific language governing permissions and
 ** limitations under the License.
 */
 
-#ifndef __utility_h
-#define __utility_h
+#ifndef _DEBUGGERD_UTILITY_H
+#define _DEBUGGERD_UTILITY_H
 
-#include <stddef.h>
 #include <stdbool.h>
+#include <sys/types.h>
 
-#ifndef PT_ARM_EXIDX
-#define PT_ARM_EXIDX    0x70000001      /* .ARM.exidx segment */
+// Figure out the abi based on defined macros.
+#if defined(__arm__)
+#define ABI_STRING "arm"
+#elif defined(__aarch64__)
+#define ABI_STRING "arm64"
+#elif defined(__mips__)
+#define ABI_STRING "mips"
+#elif defined(__i386__)
+#define ABI_STRING "x86"
+#elif defined(__x86_64__)
+#define ABI_STRING "x86_64"
+#else
+#error "Unsupported ABI"
 #endif
 
-#define STACK_CONTENT_DEPTH 32
 
-typedef struct mapinfo {
-    struct mapinfo *next;
-    unsigned start;
-    unsigned end;
-    unsigned exidx_start;
-    unsigned exidx_end;
-    char name[];
-} mapinfo;
+struct log_t{
+    /* tombstone file descriptor */
+    int tfd;
+    /* Activity Manager socket file descriptor */
+    int amfd;
+    // The tid of the thread that crashed.
+    pid_t crashed_tid;
+    // The tid of the thread we are currently working with.
+    pid_t current_tid;
+    // logd daemon crash, can block asking for logcat data, allow suppression.
+    bool should_retrieve_logcat;
 
-/* Get a word from pid using ptrace. The result is the return value. */
-extern int get_remote_word(int pid, void *src);
+    log_t()
+        : tfd(-1), amfd(-1), crashed_tid(-1), current_tid(-1), should_retrieve_logcat(true) {}
+};
 
-/* Handy routine to read aggregated data from pid using ptrace. The read 
- * values are written to the dest locations directly. 
- */
-extern void get_remote_struct(int pid, void *src, void *dst, size_t size);
+// List of types of logs to simplify the logging decision in _LOG
+enum logtype {
+  ERROR,
+  HEADER,
+  THREAD,
+  REGISTERS,
+  FP_REGISTERS,
+  BACKTRACE,
+  MAPS,
+  MEMORY,
+  STACK,
+  LOGS
+};
 
-/* Find the containing map for the pc */
-const mapinfo *pc_to_mapinfo (mapinfo *mi, unsigned pc);
+/* Log information onto the tombstone. */
+void _LOG(log_t* log, logtype ltype, const char *fmt, ...)
+        __attribute__ ((format(printf, 3, 4)));
 
-/* Map a pc address to the name of the containing ELF file */
-const char *map_to_name(mapinfo *mi, unsigned pc, const char* def);
+int wait_for_signal(pid_t tid, int* total_sleep_time_usec);
+void wait_for_stop(pid_t tid, int* total_sleep_time_usec);
 
-/* Log information onto the tombstone */
-extern void _LOG(int tfd, bool in_tombstone_only, const char *fmt, ...);
+void dump_memory(log_t* log, pid_t tid, uintptr_t addr);
 
-#endif
+#endif // _DEBUGGERD_UTILITY_H

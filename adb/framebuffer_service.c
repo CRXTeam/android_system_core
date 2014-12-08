@@ -19,51 +19,164 @@
 #include <unistd.h>
 #include <string.h>
 #include <fcntl.h>
+#include <errno.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 
-#include <cutils/fdevent.h>
+#include "fdevent.h"
 #include "adb.h"
 
 #include <linux/fb.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 
 /* TODO:
-** - grab the current buffer, not the first buffer
 ** - sync with vsync to avoid tearing
 */
+/* This version number defines the format of the fbinfo struct.
+   It must match versioning in ddms where this data is consumed. */
+#define DDMS_RAWIMAGE_VERSION 1
+struct fbinfo {
+    unsigned int version;
+    unsigned int bpp;
+    unsigned int size;
+    unsigned int width;
+    unsigned int height;
+    unsigned int red_offset;
+    unsigned int red_length;
+    unsigned int blue_offset;
+    unsigned int blue_length;
+    unsigned int green_offset;
+    unsigned int green_length;
+    unsigned int alpha_offset;
+    unsigned int alpha_length;
+} __attribute__((packed));
 
 void framebuffer_service(int fd, void *cookie)
 {
-    struct fb_var_screeninfo vinfo;
-    int fb;
-    void *ptr = MAP_FAILED;
-    char x;
-    
-    unsigned fbinfo[4];
-    
-    fb = open("/dev/graphics/fb0", O_RDONLY);
-    if(fb < 0) goto done;
+    struct fbinfo fbinfo;
+    unsigned int i, bsize;
+    char buf[640];
+    int fd_screencap;
+    int w, h, f;
+    int fds[2];
 
-    if(ioctl(fb, FBIOGET_VSCREENINFO, &vinfo) < 0) goto done;
-    fcntl(fb, F_SETFD, FD_CLOEXEC);
+    if (pipe2(fds, O_CLOEXEC) < 0) goto pipefail;
 
-    fbinfo[0] = 16;
-    fbinfo[1] = vinfo.xres * vinfo.yres * 2;
-    fbinfo[2] = vinfo.xres;
-    fbinfo[3] = vinfo.yres;
+    pid_t pid = fork();
+    if (pid < 0) goto done;
 
-    ptr = mmap(0, fbinfo[1], PROT_READ, MAP_SHARED, fb, 0);
-    if(ptr == MAP_FAILED) goto done;
-    
-    if(writex(fd, fbinfo, sizeof(unsigned) * 4)) goto done;
-
-    for(;;) {
-        if(readx(fd, &x, 1)) goto done;
-        if(writex(fd, ptr, fbinfo[1])) goto done;
+    if (pid == 0) {
+        dup2(fds[1], STDOUT_FILENO);
+        close(fds[0]);
+        close(fds[1]);
+        const char* command = "screencap";
+        const char *args[2] = {command, NULL};
+        execvp(command, (char**)args);
+        exit(1);
     }
-    
+
+    fd_screencap = fds[0];
+
+    /* read w, h & format */
+    if(readx(fd_screencap, &w, 4)) goto done;
+    if(readx(fd_screencap, &h, 4)) goto done;
+    if(readx(fd_screencap, &f, 4)) goto done;
+
+    fbinfo.version = DDMS_RAWIMAGE_VERSION;
+    /* see hardware/hardware.h */
+    switch (f) {
+        case 1: /* RGBA_8888 */
+            fbinfo.bpp = 32;
+            fbinfo.size = w * h * 4;
+            fbinfo.width = w;
+            fbinfo.height = h;
+            fbinfo.red_offset = 0;
+            fbinfo.red_length = 8;
+            fbinfo.green_offset = 8;
+            fbinfo.green_length = 8;
+            fbinfo.blue_offset = 16;
+            fbinfo.blue_length = 8;
+            fbinfo.alpha_offset = 24;
+            fbinfo.alpha_length = 8;
+            break;
+        case 2: /* RGBX_8888 */
+            fbinfo.bpp = 32;
+            fbinfo.size = w * h * 4;
+            fbinfo.width = w;
+            fbinfo.height = h;
+            fbinfo.red_offset = 0;
+            fbinfo.red_length = 8;
+            fbinfo.green_offset = 8;
+            fbinfo.green_length = 8;
+            fbinfo.blue_offset = 16;
+            fbinfo.blue_length = 8;
+            fbinfo.alpha_offset = 24;
+            fbinfo.alpha_length = 0;
+            break;
+        case 3: /* RGB_888 */
+            fbinfo.bpp = 24;
+            fbinfo.size = w * h * 3;
+            fbinfo.width = w;
+            fbinfo.height = h;
+            fbinfo.red_offset = 0;
+            fbinfo.red_length = 8;
+            fbinfo.green_offset = 8;
+            fbinfo.green_length = 8;
+            fbinfo.blue_offset = 16;
+            fbinfo.blue_length = 8;
+            fbinfo.alpha_offset = 24;
+            fbinfo.alpha_length = 0;
+            break;
+        case 4: /* RGB_565 */
+            fbinfo.bpp = 16;
+            fbinfo.size = w * h * 2;
+            fbinfo.width = w;
+            fbinfo.height = h;
+            fbinfo.red_offset = 11;
+            fbinfo.red_length = 5;
+            fbinfo.green_offset = 5;
+            fbinfo.green_length = 6;
+            fbinfo.blue_offset = 0;
+            fbinfo.blue_length = 5;
+            fbinfo.alpha_offset = 0;
+            fbinfo.alpha_length = 0;
+            break;
+        case 5: /* BGRA_8888 */
+            fbinfo.bpp = 32;
+            fbinfo.size = w * h * 4;
+            fbinfo.width = w;
+            fbinfo.height = h;
+            fbinfo.red_offset = 16;
+            fbinfo.red_length = 8;
+            fbinfo.green_offset = 8;
+            fbinfo.green_length = 8;
+            fbinfo.blue_offset = 0;
+            fbinfo.blue_length = 8;
+            fbinfo.alpha_offset = 24;
+            fbinfo.alpha_length = 8;
+           break;
+        default:
+            goto done;
+    }
+
+    /* write header */
+    if(writex(fd, &fbinfo, sizeof(fbinfo))) goto done;
+
+    /* write data */
+    for(i = 0; i < fbinfo.size; i += bsize) {
+      bsize = sizeof(buf);
+      if (i + bsize > fbinfo.size)
+        bsize = fbinfo.size - i;
+      if(readx(fd_screencap, buf, bsize)) goto done;
+      if(writex(fd, buf, bsize)) goto done;
+    }
+
 done:
-    if(ptr != MAP_FAILED) munmap(ptr, fbinfo[1]);
-    if(fb >= 0) close(fb);
+    TEMP_FAILURE_RETRY(waitpid(pid, NULL, 0));
+
+    close(fds[0]);
+    close(fds[1]);
+pipefail:
     close(fd);
 }
-

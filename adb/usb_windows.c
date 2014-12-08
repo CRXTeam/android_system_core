@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+#include <winsock2.h>
 #include <windows.h>
 #include <winerror.h>
 #include <errno.h>
@@ -246,16 +247,16 @@ usb_handle* do_usb_open(const wchar_t* interface_name) {
   }
 
   // Something went wrong.
-  errno = GetLastError();
+  int saved_errno = GetLastError();
   usb_cleanup_handle(ret);
   free(ret);
-  SetLastError(errno);
+  SetLastError(saved_errno);
 
   return NULL;
 }
 
 int usb_write(usb_handle* handle, const void* data, int len) {
-  unsigned long time_out = 500 + len * 8;
+  unsigned long time_out = 5000;
   unsigned long written = 0;
   int ret;
 
@@ -267,7 +268,7 @@ int usb_write(usb_handle* handle, const void* data, int len) {
                                (unsigned long)len,
                                &written,
                                time_out);
-    errno = GetLastError();
+    int saved_errno = GetLastError();
 
     if (ret) {
       // Make sure that we've written what we were asked to write
@@ -285,9 +286,10 @@ int usb_write(usb_handle* handle, const void* data, int len) {
       }
     } else {
       // assume ERROR_INVALID_HANDLE indicates we are disconnected
-      if (errno == ERROR_INVALID_HANDLE)
+      if (saved_errno == ERROR_INVALID_HANDLE)
         usb_kick(handle);
     }
+    errno = saved_errno;
   } else {
     D("usb_write NULL handle\n");
     SetLastError(ERROR_INVALID_HANDLE);
@@ -299,7 +301,7 @@ int usb_write(usb_handle* handle, const void* data, int len) {
 }
 
 int usb_read(usb_handle *handle, void* data, int len) {
-  unsigned long time_out = 500 + len * 8;
+  unsigned long time_out = 0;
   unsigned long read = 0;
   int ret;
 
@@ -308,25 +310,26 @@ int usb_read(usb_handle *handle, void* data, int len) {
     while (len > 0) {
       int xfer = (len > 4096) ? 4096 : len;
 
-	    ret = AdbReadEndpointSync(handle->adb_read_pipe,
-	                              (void*)data,
-	                              (unsigned long)xfer,
-	                              &read,
-	                              time_out);
-      errno = GetLastError();
-      D("usb_write got: %ld, expected: %d, errno: %d\n", read, xfer, errno);
+      ret = AdbReadEndpointSync(handle->adb_read_pipe,
+                                  data,
+                                  (unsigned long)xfer,
+                                  &read,
+                                  time_out);
+      int saved_errno = GetLastError();
+      D("usb_write got: %ld, expected: %d, errno: %d\n", read, xfer, saved_errno);
       if (ret) {
-        data += read;
+        data = (char *)data + read;
         len -= read;
 
         if (len == 0)
           return 0;
-      } else if (errno != ERROR_SEM_TIMEOUT) {
+      } else {
         // assume ERROR_INVALID_HANDLE indicates we are disconnected
-        if (errno == ERROR_INVALID_HANDLE)
+        if (saved_errno == ERROR_INVALID_HANDLE)
           usb_kick(handle);
         break;
       }
+      errno = saved_errno;
     }
   } else {
     D("usb_read NULL handle\n");
@@ -446,7 +449,7 @@ int recognized_device(usb_handle* handle) {
 }
 
 void find_devices() {
-	usb_handle* handle = NULL;
+        usb_handle* handle = NULL;
   char entry_buffer[2048];
   char interf_name[2048];
   AdbInterfaceInfo* next_interface = (AdbInterfaceInfo*)(&entry_buffer[0]);
@@ -475,11 +478,11 @@ void find_devices() {
     // Lets see if we already have this device in the list
     if (!known_device(interf_name)) {
       // This seems to be a new device. Open it!
-	    handle = do_usb_open(next_interface->device_name);
-	    if (NULL != handle) {
+        handle = do_usb_open(next_interface->device_name);
+        if (NULL != handle) {
         // Lets see if this interface (device) belongs to us
         if (recognized_device(handle)) {
-	        D("adding a new device %s\n", interf_name);
+          D("adding a new device %s\n", interf_name);
           char serial_number[512];
           unsigned long serial_number_len = sizeof(serial_number);
           if (AdbGetSerialNumber(handle->adb_interface,
@@ -488,7 +491,7 @@ void find_devices() {
                                 true)) {
             // Lets make sure that we don't duplicate this device
             if (register_new_device(handle)) {
-	            register_usb_transport(handle, serial_number);
+              register_usb_transport(handle, serial_number, NULL, 1);
             } else {
               D("register_new_device failed for %s\n", interf_name);
               usb_cleanup_handle(handle);

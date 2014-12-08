@@ -1,57 +1,52 @@
 LOCAL_PATH:= $(call my-dir)
+
+#######################################
+# init.rc
+# Only copy init.rc if the target doesn't have its own.
+ifneq ($(TARGET_PROVIDES_INIT_RC),true)
 include $(CLEAR_VARS)
 
-# files that live under /system/etc/...
+LOCAL_MODULE := init.rc
+LOCAL_SRC_FILES := $(LOCAL_MODULE)
+LOCAL_MODULE_CLASS := ETC
+LOCAL_MODULE_PATH := $(TARGET_ROOT_OUT)
 
-copy_from := \
-	etc/mountd.conf \
-	etc/dbus.conf \
-	etc/init.goldfish.sh \
-	etc/hosts \
-	etc/hcid.conf 
+include $(BUILD_PREBUILT)
+endif
+#######################################
+# init.environ.rc
 
-dont_copy := \
-	etc/init.gprs-pppd \
-	etc/ppp/chap-secrets \
-	etc/ppp/ip-down \
-	etc/ppp/ip-up
+include $(CLEAR_VARS)
+LOCAL_MODULE_CLASS := ETC
+LOCAL_MODULE := init.environ.rc
+LOCAL_MODULE_PATH := $(TARGET_ROOT_OUT)
 
-copy_to := $(addprefix $(TARGET_OUT)/,$(copy_from))
-copy_from := $(addprefix $(LOCAL_PATH)/,$(copy_from))
-
-$(copy_to) : PRIVATE_MODULE := system_etcdir
-$(copy_to) : $(TARGET_OUT)/% : $(LOCAL_PATH)/% | $(ACP)
-	$(transform-prebuilt-to-target)
-
-ALL_PREBUILT += $(copy_to)
-
-
-# files that live under /...
-
-file := $(TARGET_ROOT_OUT)/init.rc
-$(file) : $(LOCAL_PATH)/init.rc | $(ACP)
-	$(transform-prebuilt-to-target)
-ALL_PREBUILT += $(file)
-
-file := $(TARGET_ROOT_OUT)/init.goldfish.rc
-$(file) : $(LOCAL_PATH)/etc/init.goldfish.rc | $(ACP)
-	$(transform-prebuilt-to-target)
-ALL_PREBUILT += $(file)
-	
-
+# Put it here instead of in init.rc module definition,
+# because init.rc is conditionally included.
+#
 # create some directories (some are mount points)
-DIRS := $(addprefix $(TARGET_ROOT_OUT)/, \
-		sbin \
-		dev \
-		proc \
-		sys \
-		system \
-		data \
-	) \
-	$(TARGET_OUT_DATA)
+LOCAL_POST_INSTALL_CMD := mkdir -p $(addprefix $(TARGET_ROOT_OUT)/, \
+    sbin dev proc sys system data)
 
-$(DIRS):
-	@echo Directory: $@
-	@mkdir -p $@
+include $(BUILD_SYSTEM)/base_rules.mk
 
-ALL_PREBUILT += $(DIRS)
+# Regenerate init.environ.rc if PRODUCT_BOOTCLASSPATH or TARGET_LDPRELOAD has changed.
+bcp_md5 := $(word 1, $(shell echo $(PRODUCT_BOOTCLASSPATH) $(PRODUCT_SYSTEM_SERVER_CLASSPATH) $(TARGET_LDPRELOAD) | $(MD5SUM)))
+bcp_dep := $(intermediates)/$(bcp_md5).bcp.dep
+$(bcp_dep) :
+	$(hide) mkdir -p $(dir $@) && rm -rf $(dir $@)*.bcp.dep && touch $@
+
+ifneq ($(strip $(TARGET_LDPRELOAD)),)
+    TARGET_LDPRELOAD_STR := :$(TARGET_LDPRELOAD)
+endif
+
+$(LOCAL_BUILT_MODULE): $(LOCAL_PATH)/init.environ.rc.in $(bcp_dep)
+	@echo "Generate: $< -> $@"
+	@mkdir -p $(dir $@)
+	$(hide) sed -e 's?%BOOTCLASSPATH%?$(PRODUCT_BOOTCLASSPATH)?g'\
+                -e 's?%TARGET_LDPRELOAD%?$(TARGET_LDPRELOAD_STR)?g' $< >$@
+	$(hide) sed -i -e 's?%SYSTEMSERVERCLASSPATH%?$(PRODUCT_SYSTEM_SERVER_CLASSPATH)?g' $@
+
+bcp_md5 :=
+bcp_dep :=
+#######################################

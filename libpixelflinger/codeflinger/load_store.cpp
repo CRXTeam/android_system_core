@@ -18,8 +18,11 @@
 #include <assert.h>
 #include <stdio.h>
 #include <cutils/log.h>
+#include "GGLAssembler.h"
 
-#include "codeflinger/GGLAssembler.h"
+#ifdef __ARM_ARCH__
+#include <machine/cpu-features.h>
+#endif
 
 namespace android {
 
@@ -107,9 +110,27 @@ void GGLAssembler::extract(integer_t& d, int s, int h, int l, int bits)
 {
     const int maskLen = h-l;
 
+#ifdef __mips__
+    assert(maskLen<=11);
+#else
     assert(maskLen<=8);
+#endif
     assert(h);
     
+#if __ARM_ARCH__ >= 7
+    const int mask = (1<<maskLen)-1;
+    if ((h == bits) && !l && (s != d.reg)) {
+        MOV(AL, 0, d.reg, s);                   // component = packed;
+    } else if ((h == bits) && l) {
+        MOV(AL, 0, d.reg, reg_imm(s, LSR, l));  // component = packed >> l;
+    } else if (!l && isValidImmediate(mask)) {
+        AND(AL, 0, d.reg, s, imm(mask));        // component = packed & mask;
+    } else if (!l && isValidImmediate(~mask)) {
+        BIC(AL, 0, d.reg, s, imm(~mask));       // component = packed & mask;
+    } else {
+        UBFX(AL, d.reg, s, l, maskLen);         // component = (packed & mask) >> l;
+    }
+#else
     if (h != bits) {
         const int mask = ((1<<maskLen)-1) << l;
         if (isValidImmediate(mask)) {
@@ -132,6 +153,7 @@ void GGLAssembler::extract(integer_t& d, int s, int h, int l, int bits)
     if (s != d.reg) {
         MOV(AL, 0, d.reg, s);
     }
+#endif
 
     d.s = maskLen;
 }
@@ -168,7 +190,7 @@ void GGLAssembler::expand(integer_t& d, const component_t& s, int dbits)
 void GGLAssembler::expand(component_t& d, const component_t& s, int dbits)
 {
     integer_t r(d.reg, 32, d.flags);
-    expand(r, d, dbits);
+    expand(r, s, dbits);
     d = component_t(r);
 }
 
@@ -239,7 +261,7 @@ void GGLAssembler::downshift(
     int dbits = dh - dl;
     int dithering = 0;
     
-    LOGE_IF(sbits<dbits, "sbits (%d) < dbits (%d) in downshift", sbits, dbits);
+    ALOGE_IF(sbits<dbits, "sbits (%d) < dbits (%d) in downshift", sbits, dbits);
 
     if (sbits>dbits) {
         // see if we need to dither

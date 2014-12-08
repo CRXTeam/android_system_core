@@ -17,54 +17,11 @@
 #ifndef _INIT_INIT_H
 #define _INIT_INIT_H
 
-int mtd_name_to_number(const char *name);
+#include <cutils/list.h>
+
+#include <sys/stat.h>
 
 void handle_control_message(const char *msg, const char *arg);
-
-int create_socket(const char *name, int type, mode_t perm,
-                  uid_t uid, gid_t gid);
-
-void *read_file(const char *fn, unsigned *_sz);
-
-void log_init(void);
-void log_set_level(int level);
-void log_close(void);
-void log_write(int level, const char *fmt, ...);
-
-#define ERROR(x...)   log_write(3, "<3>init: " x)
-#define NOTICE(x...)  log_write(5, "<5>init: " x)
-#define INFO(x...)    log_write(6, "<6>init: " x)
-
-#define LOG_DEFAULT_LEVEL  3  /* messages <= this level are logged */
-#define LOG_UEVENTS        0  /* log uevent messages if 1. verbose */
-
-unsigned int decode_uid(const char *s);
-
-struct listnode
-{
-    struct listnode *next;
-    struct listnode *prev;
-};
-
-#define node_to_item(node, container, member) \
-    (container *) (((char*) (node)) - offsetof(container, member))
-
-#define list_declare(name) \
-    struct listnode name = { \
-        .next = &name, \
-        .prev = &name, \
-    }
-
-#define list_for_each(node, list) \
-    for (node = (list)->next; node != (list); node = node->next)
-
-void list_init(struct listnode *list);
-void list_add_tail(struct listnode *list, struct listnode *item);
-void list_remove(struct listnode *item);
-
-#define list_empty(list) ((list) == (list)->next)
-#define list_head(list) ((list)->next)
-#define list_tail(list) ((list)->prev)
 
 struct command
 {
@@ -72,10 +29,14 @@ struct command
     struct listnode clist;
 
     int (*func)(int nargs, char **args);
+
+    int line;
+    const char *filename;
+
     int nargs;
     char *args[1];
 };
-    
+
 struct action {
         /* node in list of all actions */
     struct listnode alist;
@@ -86,7 +47,7 @@ struct action {
 
     unsigned hash;
     const char *name;
-    
+
     struct listnode commands;
     struct command *current;
 };
@@ -98,6 +59,7 @@ struct socketinfo {
     uid_t uid;
     gid_t gid;
     int perm;
+    const char *socketcon;
 };
 
 struct svcenvinfo {
@@ -112,8 +74,19 @@ struct svcenvinfo {
 #define SVC_RESTARTING  0x08  /* waiting to restart */
 #define SVC_CONSOLE     0x10  /* requires console */
 #define SVC_CRITICAL    0x20  /* will reboot into recovery if keeps crashing */
+#define SVC_RESET       0x40  /* Use when stopping a process, but not disabling
+                                 so it can be restarted with its class */
+#define SVC_RC_DISABLED 0x80  /* Remember if the disabled flag was set in the rc script */
+#define SVC_RESTART     0x100 /* Use to safely restart (stop, wait, start) a service */
+#define SVC_DISABLED_START 0x200 /* a start was requested but it was disabled at the time */
 
-#define NR_SVC_SUPP_GIDS 6    /* six supplementary groups */
+#ifndef NR_SVC_SUPP_GIDS
+#define NR_SVC_SUPP_GIDS 12    /* twelve supplementary groups */
+#endif
+
+#define COMMAND_RETRY_TIMEOUT 5
+
+#define COLDBOOT_RETRY_TIMEOUT 10
 
 struct service {
         /* list of all services */
@@ -133,35 +106,44 @@ struct service {
     gid_t supp_gids[NR_SVC_SUPP_GIDS];
     size_t nr_supp_gids;
 
+    char *seclabel;
+
     struct socketinfo *sockets;
     struct svcenvinfo *envvars;
 
-    int nargs;
-    char *args[1];
     struct action onrestart;  /* Actions to execute on restart. */
-};
+    
+    /* keycodes for triggering this service via /dev/keychord */
+    int *keycodes;
+    int nkeycodes;
+    int keychord_id;
 
-int parse_config_file(const char *fn);
+    int ioprio_class;
+    int ioprio_pri;
+
+    int nargs;
+    /* "MUST BE AT THE END OF THE STRUCT" */
+    char *args[1];
+}; /*     ^-------'args' MUST be at the end of this struct! */
+
+void notify_service_state(const char *name, const char *state);
 
 struct service *service_find_by_name(const char *name);
 struct service *service_find_by_pid(pid_t pid);
+struct service *service_find_by_keychord(int keychord_id);
+void service_for_each(void (*func)(struct service *svc));
 void service_for_each_class(const char *classname,
                             void (*func)(struct service *svc));
 void service_for_each_flags(unsigned matchflags,
                             void (*func)(struct service *svc));
 void service_stop(struct service *svc);
-void service_start(struct service *svc);
+void service_reset(struct service *svc);
+void service_restart(struct service *svc);
+void service_start(struct service *svc, const char *dynamic_args);
 void property_changed(const char *name, const char *value);
 
-struct action *action_remove_queue_head(void);
-void action_add_queue_tail(struct action *act);
-void action_for_each_trigger(const char *trigger,
-                             void (*func)(struct action *act));
-void queue_property_triggers(const char *name, const char *value);
-void queue_all_property_triggers();
-
-#define INIT_IMAGE_FILE	"/initlogo.rle"
-
-int load_565rle_image( char *file_name );
+extern struct selabel_handle *sehandle;
+extern struct selabel_handle *sehandle_prop;
+extern int selinux_reload_policy(void);
 
 #endif	/* _INIT_INIT_H */
